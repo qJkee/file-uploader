@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -199,4 +203,211 @@ func (s *Store) trashPath(bucket, hash string) string {
 
 func (s *Store) tmpDir() string {
 	return filepath.Join(s.dataDir, "tmp")
+}
+
+var (
+	// ErrNotFound means no objects row exists at the path. 404.
+	ErrNotFound = errors.New("object not found")
+	// ErrBlobMissing means a row resolved but its file is gone. The invariant
+	// the locking design exists to protect has broken: 500, never a silent
+	// repair, because destroying data on a read is worse than an error.
+	ErrBlobMissing = errors.New("blob missing")
+)
+
+// PutResult describes what a Put did. Created drives 201-vs-200; Dedup says
+// the bytes were already on disk under this bucket.
+type PutResult struct {
+	Hash    string
+	Created bool
+	Dedup   bool
+	Size    int64
+}
+
+// Put stores the bytes of body at (bucket, objectID), overwriting whatever was
+// there. Identical bytes already present in this bucket are stored once.
+//
+// The ordering is load-bearing: the bytes are made durable before the row
+// commits, never the reverse. A crash in that window leaves an orphan file,
+// which the sweeper collects; the reverse would leave a row pointing at
+// nothing — a 500 for an object the client was told was stored.
+func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader) (PutResult, error) {
+	if err := validateBucket(bucket); err != nil {
+		return PutResult{}, err
+	}
+	if err := validateObjectID(objectID); err != nil {
+		return PutResult{}, err
+	}
+
+	tmp, err := os.CreateTemp(s.tmpDir(), "put-*")
+	if err != nil {
+		return PutResult{}, fmt.Errorf("create temp: %w", err)
+	}
+	// A no-op after a successful rename, and the thing that stops an aborted
+	// upload leaking a file.
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	digest := sha256.New()
+	size, err := io.Copy(io.MultiWriter(tmp, digest), body)
+	if err != nil {
+		return PutResult{}, err // unwrapped: the handler classifies it
+	}
+	// Durable data, then a durable directory entry (see renameDurable).
+	if err := tmp.Sync(); err != nil {
+		return PutResult{}, fmt.Errorf("sync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return PutResult{}, fmt.Errorf("close temp: %w", err)
+	}
+
+	hash := hex.EncodeToString(digest.Sum(nil))
+	res := PutResult{Hash: hash, Size: size}
+	if err := os.MkdirAll(s.blobDir(bucket, hash), 0o755); err != nil {
+		return PutResult{}, fmt.Errorf("create blob dir: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	if err != nil {
+		return PutResult{}, err
+	}
+	defer tx.Rollback()
+
+	var current string
+	err = tx.QueryRowContext(ctx,
+		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+		bucket, objectID).Scan(&current)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res.Created = true
+	case err != nil:
+		return PutResult{}, err
+	}
+
+	// DO UPDATE rather than DO NOTHING: DO NOTHING takes no lock on the
+	// existing row, and that lock is what blocks the sweeper from deleting
+	// this blob between our stat and our commit.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO blobs (bucket, hash) VALUES (?, ?)
+		 ON CONFLICT (bucket, hash) DO UPDATE SET hash = excluded.hash`,
+		bucket, hash); err != nil {
+		return PutResult{}, err
+	}
+
+	blobPath := s.blobPath(bucket, hash)
+	switch _, err := os.Stat(blobPath); {
+	case err == nil:
+		res.Dedup = true // identical content by construction; leave the file
+	case os.IsNotExist(err):
+		if err := renameDurable(tmp.Name(), blobPath); err != nil {
+			return PutResult{}, err
+		}
+	default:
+		return PutResult{}, fmt.Errorf("stat blob: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO objects (bucket, object_id, hash) VALUES (?, ?, ?)
+		 ON CONFLICT (bucket, object_id) DO UPDATE SET hash = excluded.hash`,
+		bucket, objectID, hash); err != nil {
+		return PutResult{}, err
+	}
+
+	if s.hookBeforeCommit != nil {
+		s.hookBeforeCommit()
+	}
+	if err := tx.Commit(); err != nil {
+		return PutResult{}, err
+	}
+	return res, nil
+}
+
+// Head returns the current content hash of an object.
+func (s *Store) Head(ctx context.Context, bucket, objectID string) (string, error) {
+	if err := validateBucket(bucket); err != nil {
+		return "", err
+	}
+	if err := validateObjectID(objectID); err != nil {
+		return "", err
+	}
+	return s.lookup(ctx, bucket, objectID)
+}
+
+func (s *Store) lookup(ctx context.Context, bucket, objectID string) (string, error) {
+	var hash string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+		bucket, objectID).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return hash, err
+}
+
+// Get opens the blob an object resolves to. The file is the caller's to close.
+// Once it is open a sweeper unlink cannot break the transfer: on POSIX an open
+// fd stays valid after the directory entry is gone.
+func (s *Store) Get(ctx context.Context, bucket, objectID string) (*os.File, string, error) {
+	if err := validateBucket(bucket); err != nil {
+		return nil, "", err
+	}
+	if err := validateObjectID(objectID); err != nil {
+		return nil, "", err
+	}
+
+	hash, err := s.lookup(ctx, bucket, objectID)
+	if err != nil {
+		return nil, "", err
+	}
+	f, err := os.Open(s.blobPath(bucket, hash))
+	if err == nil {
+		return f, hash, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", err
+	}
+
+	// The file vanished between the row read and the open. Re-read the row
+	// once: this resolves the sweeper race rather than making it unlikely,
+	// which is why the sweeper needs no grace period. Error path only, so the
+	// happy path pays nothing.
+	if s.hookGetMiss != nil {
+		s.hookGetMiss()
+	}
+	second, err := s.lookup(ctx, bucket, objectID)
+	if err != nil {
+		return nil, "", err // concurrently deleted: ErrNotFound
+	}
+	if second == hash {
+		return nil, "", fmt.Errorf("%w: %s/%s hash %s", ErrBlobMissing, bucket, objectID, hash)
+	}
+	f, err = os.Open(s.blobPath(bucket, second))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("%w: %s/%s hash %s", ErrBlobMissing, bucket, objectID, second)
+		}
+		return nil, "", err
+	}
+	return f, second, nil
+}
+
+// renameDurable moves src onto dst and makes the new directory entry durable.
+// Syncing the data alone is not enough: power loss could drop the rename while
+// the committed row survives.
+func renameDurable(src, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("rename blob into place: %w", err)
+	}
+	return fsyncDir(filepath.Dir(dst))
+}
+
+func fsyncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open dir for fsync: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", path, err)
+	}
+	return nil
 }
