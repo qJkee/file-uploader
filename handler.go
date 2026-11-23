@@ -5,9 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -25,10 +28,41 @@ func NewHandler(s *Store) *Handler {
 
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /objects/{bucket}/{objectID}", h.put)
-	mux.HandleFunc("GET /objects/{bucket}/{objectID}", h.get)
-	mux.HandleFunc("DELETE /objects/{bucket}/{objectID}", h.delete)
+	mux.Handle("PUT /objects/{bucket}/{objectID}", instrument("PUT", http.HandlerFunc(h.put)))
+	mux.Handle("GET /objects/{bucket}/{objectID}", instrument("GET", http.HandlerFunc(h.get)))
+	mux.Handle("DELETE /objects/{bucket}/{objectID}", instrument("DELETE", http.HandlerFunc(h.delete)))
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /healthz", h.health)
 	return mux
+}
+
+// instrument wraps one route with the standard promhttp middleware rather
+// than a hand-rolled one. The method label comes from the route, not the
+// request, so it cannot be driven by a client.
+func instrument(method string, next http.Handler) http.Handler {
+	return promhttp.InstrumentHandlerDuration(
+		requestDuration.MustCurryWith(prometheus.Labels{"method": method}),
+		promhttp.InstrumentHandlerCounter(
+			requestsTotal.MustCurryWith(prometheus.Labels{"method": method}),
+			next))
+}
+
+// health reports ready when the metadata database answers and the data
+// directory is writable.
+func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
+	var one int
+	if err := h.store.DB().QueryRowContext(r.Context(), `SELECT 1`).Scan(&one); err != nil {
+		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	probe, err := os.CreateTemp(h.store.tmpDir(), "healthz-*")
+	if err != nil {
+		http.Error(w, "data directory not writable", http.StatusServiceUnavailable)
+		return
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +95,11 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.fail(w, r, err)
 		return
+	}
+
+	putBytesTotal.Add(float64(res.Size))
+	if res.Dedup {
+		dedupHitsTotal.Inc()
 	}
 
 	w.Header().Set("ETag", etagOf(res.Hash))
@@ -196,6 +235,7 @@ func statusFor(err error) int {
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrBlobMissing):
+		blobMissingTotal.Inc()
 		return http.StatusInternalServerError
 	case errors.As(err, &maxBytes):
 		return http.StatusRequestEntityTooLarge

@@ -32,15 +32,17 @@ type SweepResult struct {
 // re-checks the anti-join inside its own transaction, and the foreign key
 // from objects to blobs blocks a PUT of the same content for exactly that
 // hash while the reclaim holds the row.
-func (s *Store) Sweep(ctx context.Context) (SweepResult, error) {
-	var res SweepResult
-	if err := s.reclaim(ctx, &res); err != nil {
+func (s *Store) Sweep(ctx context.Context) (res SweepResult, err error) {
+	start := time.Now()
+	defer func() { observeSweep(res, err, time.Since(start).Seconds()) }()
+
+	if err = s.reclaim(ctx, &res); err != nil {
 		return res, err
 	}
-	if err := s.expireTrash(ctx, &res); err != nil {
+	if err = s.expireTrash(ctx, &res); err != nil {
 		return res, err
 	}
-	if err := s.cleanTmp(ctx, &res); err != nil {
+	if err = s.cleanTmp(ctx, &res); err != nil {
 		return res, err
 	}
 	return res, nil
@@ -262,6 +264,7 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 			return err
 		}
 		reclaimed++
+		startupOrphansDeleted.Inc()
 		return nil
 	})
 	return reclaimed, err
