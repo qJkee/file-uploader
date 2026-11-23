@@ -37,6 +37,18 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	pre, ok := writePreconditions(r)
+	if !ok {
+		http.Error(w, "malformed precondition header", http.StatusBadRequest)
+		return
+	}
+	// Advisory precondition check, before the size check and before a byte of
+	// body is read, so a doomed 32 MiB upload is never transferred. It is
+	// racy on its own; the authoritative check is inside Put's transaction.
+	if err := h.precheck(r, bucket, objectID, pre); err != nil {
+		h.fail(w, r, err)
+		return
+	}
 	// Reject an oversize declared length before reading a byte of it.
 	if r.ContentLength > h.maxObjectSize {
 		http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
@@ -45,7 +57,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 	// Catches chunked uploads that omitted or lied about a length.
 	body := http.MaxBytesReader(w, r.Body, h.maxObjectSize)
 
-	res, err := h.store.Put(r.Context(), bucket, objectID, body)
+	res, err := h.store.Put(r.Context(), bucket, objectID, body, pre)
 	if err != nil {
 		h.fail(w, r, err)
 		return
@@ -87,11 +99,53 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	if err := h.store.Delete(r.Context(), bucket, objectID); err != nil {
+	pre, ok := writePreconditions(r)
+	if !ok {
+		http.Error(w, "malformed precondition header", http.StatusBadRequest)
+		return
+	}
+	if err := h.store.Delete(r.Context(), bucket, objectID, pre); err != nil {
 		h.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writePreconditions parses the headers a write evaluates. GET's
+// If-None-Match is not read here: http.ServeContent handles it.
+func writePreconditions(r *http.Request) (Precondition, bool) {
+	var pre Precondition
+	if v := r.Header.Get("If-Match"); v != "" {
+		list, ok := parseTagList(v)
+		if !ok {
+			return pre, false
+		}
+		pre.IfMatch = list
+	}
+	if v := r.Header.Get("If-None-Match"); v != "" {
+		list, ok := parseTagList(v)
+		if !ok {
+			return pre, false
+		}
+		pre.IfNoneMatch = list
+	}
+	return pre, true
+}
+
+// precheck is the advisory half of the precondition evaluation. A missing
+// object is not an error here: Put decides 412-vs-201 authoritatively.
+func (h *Handler) precheck(r *http.Request, bucket, objectID string, pre Precondition) error {
+	if pre.IfMatch == nil && pre.IfNoneMatch == nil {
+		return nil
+	}
+	hash, err := h.store.Head(r.Context(), bucket, objectID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return pre.check("", false)
+	case err != nil:
+		return err
+	}
+	return pre.check(hash, true)
 }
 
 func validateNames(bucket, objectID string) error {
@@ -137,6 +191,8 @@ func statusFor(err error) int {
 		return http.StatusOK
 	case errors.Is(err, ErrInvalidName):
 		return http.StatusBadRequest
+	case errors.Is(err, ErrPrecondition):
+		return http.StatusPreconditionFailed
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrBlobMissing):

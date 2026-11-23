@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -254,6 +255,234 @@ func TestOversizeChunkedIs413(t *testing.T) {
 	}
 	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
 		t.Errorf("temp files left behind = %d, want 0", n)
+	}
+}
+
+func hdr(k, v string) http.Header { return http.Header{k: {v}} }
+
+func TestGetETagAndNotModified(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "hello").Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("PUT returned no ETag")
+	}
+	if strings.HasPrefix(etag, "W/") {
+		t.Errorf("ETag = %q, want a strong tag — If-Match needs strong comparison", etag)
+	}
+
+	resp := ts.do(t, http.MethodGet, "/objects/b1/a", nil, hdr("If-None-Match", etag))
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("If-None-Match with the current tag = %d, want 304", resp.StatusCode)
+	}
+	if got := readBody(t, resp); got != "" {
+		t.Errorf("304 body = %q, want empty", got)
+	}
+
+	resp = ts.do(t, http.MethodGet, "/objects/b1/a", nil, hdr("If-None-Match", `"stale"`))
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("If-None-Match with a stale tag = %d, want 200", resp.StatusCode)
+	}
+	if got := readBody(t, resp); got != "hello" {
+		t.Errorf("body = %q, want %q", got, "hello")
+	}
+
+	resp = ts.do(t, http.MethodGet, "/objects/b1/a", nil, hdr("If-None-Match", `"stale", `+etag))
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("If-None-Match list containing the current tag = %d, want 304", resp.StatusCode)
+	}
+	resp = ts.do(t, http.MethodGet, "/objects/b1/a", nil, hdr("If-None-Match", "*"))
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("If-None-Match: * on an existing object = %d, want 304", resp.StatusCode)
+	}
+}
+
+// TestLostUpdatePrevented is the whole point of the feature: two clients read
+// the same ETag and both write back.
+func TestLostUpdatePrevented(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
+
+	type result struct {
+		status int
+		body   string
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	for i, body := range []string{"first", "second"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp := ts.do(t, http.MethodPut, "/objects/b1/a",
+				strings.NewReader(body), hdr("If-Match", etag))
+			results[i] = result{resp.StatusCode, body}
+		}()
+	}
+	wg.Wait()
+
+	var winner string
+	wins, conflicts := 0, 0
+	for _, r := range results {
+		switch {
+		case r.status >= 200 && r.status < 300:
+			wins++
+			winner = r.body
+		case r.status == http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("unexpected status %d", r.status)
+		}
+	}
+	if wins != 1 || conflicts != 1 {
+		t.Fatalf("got %d winners and %d conflicts, want exactly 1 of each", wins, conflicts)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
+		t.Errorf("stored body = %q, want the winner's %q", got, winner)
+	}
+}
+
+func TestIfMatchOnMissingIs412(t *testing.T) {
+	ts := newTestServer(t)
+	resp := ts.do(t, http.MethodPut, "/objects/b1/nope",
+		strings.NewReader("x"), hdr("If-Match", `"whatever"`))
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf("If-Match on a missing path = %d, want 412 (not 404)", resp.StatusCode)
+	}
+}
+
+func TestIfNoneMatchStar(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp := ts.do(t, http.MethodPut, "/objects/b1/a",
+		strings.NewReader("first"), hdr("If-None-Match", "*"))
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("create-only on an absent path = %d, want 201", resp.StatusCode)
+	}
+
+	resp = ts.do(t, http.MethodPut, "/objects/b1/a",
+		strings.NewReader("second"), hdr("If-None-Match", "*"))
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf("create-only on an existing path = %d, want 412", resp.StatusCode)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != "first" {
+		t.Errorf("body after the 412 = %q, want %q", got, "first")
+	}
+}
+
+func TestIfMatchOnDelete(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "hello").Header.Get("ETag")
+
+	resp := ts.do(t, http.MethodDelete, "/objects/b1/a", nil, hdr("If-Match", `"wrong"`))
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf("DELETE with a mismatched If-Match = %d, want 412", resp.StatusCode)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != "hello" {
+		t.Errorf("body after the 412 = %q, want %q", got, "hello")
+	}
+
+	resp = ts.do(t, http.MethodDelete, "/objects/b1/a", nil, hdr("If-Match", etag))
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("DELETE with a matching If-Match = %d, want 204", resp.StatusCode)
+	}
+}
+
+func TestFailedPreconditionLeavesNoTrace(t *testing.T) {
+	ts := newTestServer(t)
+	ts.put(t, "/objects/b1/a", "hello")
+
+	resp := ts.do(t, http.MethodPut, "/objects/b1/a",
+		strings.NewReader("other"), hdr("If-None-Match", "*"))
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412", resp.StatusCode)
+	}
+
+	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
+		t.Errorf("temp files = %d, want 0", n)
+	}
+	var blobs int
+	if err := ts.store.DB().QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobs); err != nil {
+		t.Fatal(err)
+	}
+	if blobs != 1 {
+		t.Errorf("blobs rows = %d, want 1 — a 412 must create none", blobs)
+	}
+}
+
+// TestOversizeWithFailingIfMatchIs412 proves the advisory pre-check fires:
+// the doomed body is never transferred, so the answer is 412 and not 413.
+func TestOversizeWithFailingIfMatchIs412(t *testing.T) {
+	ts := newTestServer(t)
+	ts.put(t, "/objects/b1/a", "hello")
+	ts.store.cfg.MaxObjectSize = 8
+	srv := httptest.NewServer(NewHandler(ts.store).Mux())
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
+		srv.URL+"/objects/b1/a", strings.NewReader(strings.Repeat("x", 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("If-Match", `"wrong"`)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want 412 — the advisory check must run before the size check", resp.StatusCode)
+	}
+}
+
+// TestABA: the ETag is a content hash, not a version counter, so content
+// going A -> B -> A leaves an old "A" tag succeeding. That is the better
+// behaviour: the client's read-modify-write was computed against A and
+// current content is A, so its change is still valid.
+func TestABA(t *testing.T) {
+	ts := newTestServer(t)
+	etagA := ts.put(t, "/objects/b1/a", "A").Header.Get("ETag")
+	ts.put(t, "/objects/b1/a", "B")
+	ts.put(t, "/objects/b1/a", "A")
+
+	resp := ts.do(t, http.MethodPut, "/objects/b1/a",
+		strings.NewReader("C"), hdr("If-Match", etagA))
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("If-Match with the original tag after A->B->A = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestIdenticalContentSharesETag(t *testing.T) {
+	ts := newTestServer(t)
+	first := ts.put(t, "/objects/b1/a", "hello").Header.Get("ETag")
+	second := ts.put(t, "/objects/b1/b", "hello").Header.Get("ETag")
+
+	if first != second {
+		t.Errorf("ETags %q and %q differ for identical content", first, second)
+	}
+}
+
+func TestNoPreconditionIsLastWriterWins(t *testing.T) {
+	ts := newTestServer(t)
+	ts.put(t, "/objects/b1/a", "first")
+
+	if got := ts.put(t, "/objects/b1/a", "second").StatusCode; got != http.StatusOK {
+		t.Errorf("status = %d, want 200", got)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != "second" {
+		t.Errorf("body = %q, want %q", got, "second")
+	}
+}
+
+func TestMalformedPreconditionIs400(t *testing.T) {
+	ts := newTestServer(t)
+	ts.put(t, "/objects/b1/a", "hello")
+
+	for _, v := range []string{`a`, `"a",`, `""x`} {
+		resp := ts.do(t, http.MethodPut, "/objects/b1/a", strings.NewReader("x"), hdr("If-Match", v))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("If-Match: %s = %d, want 400", v, resp.StatusCode)
+		}
 	}
 }
 

@@ -230,7 +230,7 @@ type PutResult struct {
 // commits, never the reverse. A crash in that window leaves an orphan file,
 // which the sweeper collects; the reverse would leave a row pointing at
 // nothing — a 500 for an object the client was told was stored.
-func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader) (PutResult, error) {
+func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader, pre Precondition) (PutResult, error) {
 	if err := validateBucket(bucket); err != nil {
 		return PutResult{}, err
 	}
@@ -272,6 +272,10 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	}
 	defer tx.Rollback()
 
+	// This single read does double duty: it is the authoritative precondition
+	// check, and it decides 201-vs-200. Outside the transaction another PUT
+	// lands between the read and the write and the lost update is back with a
+	// smaller window.
 	var current string
 	err = tx.QueryRowContext(ctx,
 		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
@@ -280,6 +284,9 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	case errors.Is(err, sql.ErrNoRows):
 		res.Created = true
 	case err != nil:
+		return PutResult{}, err
+	}
+	if err := pre.check(current, !res.Created); err != nil {
 		return PutResult{}, err
 	}
 
@@ -332,7 +339,7 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 // The transaction is unconditional even though this was one statement before
 // preconditions existed: splitting the SELECT and the DELETE across a
 // transaction boundary would be check-then-act, and DELETE is not a hot path.
-func (s *Store) Delete(ctx context.Context, bucket, objectID string) error {
+func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precondition) error {
 	if err := validateBucket(bucket); err != nil {
 		return err
 	}
@@ -350,11 +357,17 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string) error {
 	err = tx.QueryRowContext(ctx,
 		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
 		bucket, objectID).Scan(&hash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
+	exists := !errors.Is(err, sql.ErrNoRows)
+	if err != nil && exists {
 		return err
+	}
+	// The precondition outranks the 404: RFC 9110 makes a missing resource
+	// with If-Match present a 412.
+	if err := pre.check(hash, exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
 	}
 
 	if _, err := tx.ExecContext(ctx,

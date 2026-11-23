@@ -31,7 +31,7 @@ func withSweepLimit(t *testing.T, n int) {
 func TestSweepMovesUnreferencedBlobToTrash(t *testing.T) {
 	s := newTestStore(t)
 	mustPut(t, s, "b1", "a", "hello")
-	if err := s.Delete(t.Context(), "b1", "a"); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestSweepDrainsBacklogLargerThanLimit(t *testing.T) {
 	for i := range n {
 		id := fmt.Sprintf("o%d", i)
 		mustPut(t, s, "b1", id, fmt.Sprintf("body-%d", i))
-		if err := s.Delete(t.Context(), "b1", id); err != nil {
+		if err := s.Delete(t.Context(), "b1", id, Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 	}
@@ -101,7 +101,7 @@ func TestSweepBudgetStops(t *testing.T) {
 	for i := range n {
 		id := fmt.Sprintf("o%d", i)
 		mustPut(t, s, "b1", id, fmt.Sprintf("body-%d", i))
-		if err := s.Delete(t.Context(), "b1", id); err != nil {
+		if err := s.Delete(t.Context(), "b1", id, Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 	}
@@ -119,7 +119,7 @@ func TestTrashRetention(t *testing.T) {
 	mustPut(t, s, "b1", "old", "old-body")
 	mustPut(t, s, "b1", "new", "new-body")
 	for _, id := range []string{"old", "new"} {
-		if err := s.Delete(t.Context(), "b1", id); err != nil {
+		if err := s.Delete(t.Context(), "b1", id, Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 	}
@@ -154,7 +154,7 @@ func TestTrashRetentionZeroUnlinks(t *testing.T) {
 	s := newTestStore(t)
 	s.cfg.TrashRetention = 0
 	mustPut(t, s, "b1", "a", "hello")
-	if err := s.Delete(t.Context(), "b1", "a"); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -313,7 +313,7 @@ func TestOrphanWalkSkippedWhenBlobsTableEmpty(t *testing.T) {
 func TestTrashRecoveryPath(t *testing.T) {
 	s := newTestStore(t)
 	mustPut(t, s, "b1", "a", "hello")
-	if err := s.Delete(t.Context(), "b1", "a"); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	mustSweep(t, s)
