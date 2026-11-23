@@ -215,6 +215,99 @@ func TestTmpCleanup(t *testing.T) {
 	}
 }
 
+// writeOrphanBlob drops a file into the blob tree with no blobs row — what a
+// crash between the rename and the commit leaves behind.
+func writeOrphanBlob(t *testing.T, s *Store, bucket, body string) string {
+	t.Helper()
+	hash := hashOf(body)
+	path := s.blobPath(bucket, hash)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	return path
+}
+
+func TestOrphanWalkMovesUnknownBlobToTrash(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "kept") // the guard needs a non-empty blobs table
+	orphan := writeOrphanBlob(t, s, "b1", "orphan")
+
+	n, err := s.SweepOrphans(t.Context(), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+
+	if n != 1 {
+		t.Errorf("reclaimed = %d, want 1", n)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("orphan survived the walk: %v", err)
+	}
+	if _, err := os.Stat(s.trashPath("b1", hashOf("orphan"))); err != nil {
+		t.Errorf("orphan is not in trash: %v — the walk must rename, not unlink", err)
+	}
+}
+
+func TestOrphanWalkKeepsKnownBlob(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "hello")
+
+	if _, err := s.SweepOrphans(t.Context(), time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+
+	if got := mustGet(t, s, "b1", "a"); got != "hello" {
+		t.Errorf("a = %q, want %q", got, "hello")
+	}
+}
+
+// TestOrphanWalkSkipsFilesNewerThanStart covers the race with in-flight PUTs,
+// which are creating blobs while the walk runs.
+func TestOrphanWalkSkipsFilesNewerThanStart(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "kept")
+	orphan := writeOrphanBlob(t, s, "b1", "orphan")
+
+	n, err := s.SweepOrphans(t.Context(), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+
+	if n != 0 {
+		t.Errorf("reclaimed = %d, want 0", n)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("a blob newer than process start was reclaimed: %v", err)
+	}
+}
+
+// TestOrphanWalkSkippedWhenBlobsTableEmpty is the guard that stops a lost or
+// replaced meta.db from deleting every object on disk. It is unrecoverable in
+// principle: blob filenames are hashes, so even with the bytes intact the
+// object IDs that pointed at them can never be reconstructed.
+func TestOrphanWalkSkippedWhenBlobsTableEmpty(t *testing.T) {
+	s := newTestStore(t)
+	first := writeOrphanBlob(t, s, "b1", "one")
+	second := writeOrphanBlob(t, s, "b2", "two")
+
+	n, err := s.SweepOrphans(t.Context(), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+
+	if n != 0 {
+		t.Errorf("reclaimed = %d, want 0 — the walk must not run against an empty blobs table", n)
+	}
+	for _, p := range []string{first, second} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("blob destroyed with an empty blobs table: %v", err)
+		}
+	}
+}
+
 // TestTrashRecoveryPath exercises the manual recovery the trash window exists
 // for: rename the file back and reinsert its rows.
 func TestTrashRecoveryPath(t *testing.T) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -196,6 +198,100 @@ func (s *Store) cleanTmp(ctx context.Context, res *SweepResult) error {
 		res.TmpDeleted++
 		return nil
 	})
+}
+
+// SweepOrphans moves blob files with no blobs row to trash — crash orphans,
+// bytes renamed into place by a PUT that died before committing. It runs once
+// per process. Trash rather than unlink because this is the most dangerous
+// operation in the system, which is exactly why it should be the one most
+// clearly recoverable.
+//
+// startedAt is captured before the server accepts traffic: files newer than
+// it belong to in-flight PUTs and are left alone, which is what lets the walk
+// run in the background instead of blocking startup.
+func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, error) {
+	blobsRoot := filepath.Join(s.dataDir, "blobs")
+
+	// The guard. Without it a lost or replaced meta.db — wrong volume
+	// mounted, bad restore, someone clearing the directory — means the
+	// service starts on an empty schema and deletes every object on disk,
+	// silently and permanently.
+	var hasRows bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM blobs)`).Scan(&hasRows); err != nil {
+		return 0, err
+	}
+	if !hasRows {
+		empty, err := isEmptyTree(ctx, blobsRoot)
+		if err != nil {
+			return 0, err
+		}
+		if !empty {
+			slog.Error("blobs table is empty but the blob tree is not; skipping the orphan walk",
+				"blobs_dir", blobsRoot,
+				"hint", "check that the expected meta.db is mounted before restarting")
+		}
+		return 0, nil
+	}
+
+	reclaimed := 0
+	err := walkFiles(ctx, blobsRoot, func(path string, info fs.FileInfo) error {
+		if !info.ModTime().Before(startedAt) {
+			return nil
+		}
+		bucket, hash, ok := parseBlobPath(blobsRoot, path)
+		if !ok {
+			return nil // not something this service wrote; leave it
+		}
+		var known bool
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = ? AND hash = ?)`,
+			bucket, hash).Scan(&known); err != nil {
+			return err
+		}
+		if known {
+			return nil
+		}
+		if err := os.MkdirAll(s.trashDir(bucket), 0o755); err != nil {
+			return err
+		}
+		if err := os.Rename(path, s.trashPath(bucket, hash)); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		reclaimed++
+		return nil
+	})
+	return reclaimed, err
+}
+
+// parseBlobPath reverses blobPath: blobs/{bucket}/{hh}/{hash}. A file that
+// does not fit that shape is not ours to move.
+func parseBlobPath(root, path string) (bucket, hash string, ok bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	bucket, hh, hash := parts[0], parts[1], parts[2]
+	if len(hash) < 2 || hh != hash[:2] {
+		return "", "", false
+	}
+	return bucket, hash, true
+}
+
+func isEmptyTree(ctx context.Context, root string) (bool, error) {
+	empty := true
+	err := walkFiles(ctx, root, func(string, fs.FileInfo) error {
+		empty = false
+		return filepath.SkipAll
+	})
+	return empty, err
 }
 
 // walkFiles visits every regular file under root. A missing root is not an
