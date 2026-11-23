@@ -37,8 +37,12 @@ func mustGet(t *testing.T, s *Store, bucket, objectID string) string {
 
 func countBlobFiles(t *testing.T, s *Store) int {
 	t.Helper()
+	return countFiles(t, filepath.Join(s.dataDir, "blobs"))
+}
+
+func countFiles(t *testing.T, root string) int {
+	t.Helper()
 	n := 0
-	root := filepath.Join(s.dataDir, "blobs")
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -227,6 +231,41 @@ func TestGetRetryOverwritten(t *testing.T) {
 
 	if got := mustGet(t, s, "b1", "a"); got != "world" {
 		t.Errorf("Get after a concurrent overwrite = %q, want %q", got, "world")
+	}
+}
+
+func TestDeleteRemovesRowNotFile(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "hello")
+
+	if err := s.Delete(t.Context(), "b1", "a"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, _, err := s.Get(t.Context(), "b1", "a"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get after Delete = %v, want ErrNotFound", err)
+	}
+	if got := countBlobFiles(t, s); got != 1 {
+		t.Errorf("blob files = %d, want 1 — DELETE must do no filesystem work", got)
+	}
+}
+
+func TestDeleteMissing(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Delete(t.Context(), "b1", "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete of a missing object = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteOneOfTwoSharedIDs(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "hello")
+	mustPut(t, s, "b1", "b", "hello")
+
+	if err := s.Delete(t.Context(), "b1", "a"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := mustGet(t, s, "b1", "b"); got != "hello" {
+		t.Errorf("b = %q, want %q — deleting a sibling destroyed the shared blob", got, "hello")
 	}
 }
 

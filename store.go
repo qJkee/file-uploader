@@ -298,6 +298,10 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	case err == nil:
 		res.Dedup = true // identical content by construction; leave the file
 	case os.IsNotExist(err):
+		// shortcut: a PUT of content currently sitting in trash writes a
+		// fresh copy rather than resurrecting it. Correct, slightly wasteful.
+		// Add a trash stat here if delete/re-upload churn turns out to be
+		// common.
 		if err := renameDurable(tmp.Name(), blobPath); err != nil {
 			return PutResult{}, err
 		}
@@ -319,6 +323,46 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 		return PutResult{}, err
 	}
 	return res, nil
+}
+
+// Delete drops the object's row. It never unlinks bytes: the sweeper reclaims
+// a blob once nothing references it, which keeps the write lock off the
+// filesystem and bounds deletion cost off the request path.
+//
+// The transaction is unconditional even though this was one statement before
+// preconditions existed: splitting the SELECT and the DELETE across a
+// transaction boundary would be check-then-act, and DELETE is not a hot path.
+func (s *Store) Delete(ctx context.Context, bucket, objectID string) error {
+	if err := validateBucket(bucket); err != nil {
+		return err
+	}
+	if err := validateObjectID(objectID); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var hash string
+	err = tx.QueryRowContext(ctx,
+		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+		bucket, objectID).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM objects WHERE bucket = ? AND object_id = ?`,
+		bucket, objectID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Head returns the current content hash of an object.
