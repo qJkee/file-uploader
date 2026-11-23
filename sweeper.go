@@ -22,6 +22,7 @@ var sweepLimit = 1000
 type SweepResult struct {
 	Candidates   int
 	Reclaimed    int
+	Orphans      int
 	Failed       int
 	TrashDeleted int
 	TmpDeleted   int
@@ -44,10 +45,36 @@ func (s *Store) Sweep(ctx context.Context) (res SweepResult, err error) {
 	// disk without bound.
 	err = errors.Join(
 		s.reclaim(ctx, &res),
+		s.sweepOrphansIfDue(ctx, &res),
 		s.expireTrash(ctx, &res),
 		s.cleanTmp(ctx, &res),
 	)
 	return res, err
+}
+
+// orphanSweepInterval bounds how often the blob tree is walked. The reclaim
+// anti-join only sees blobs that have a row, so a PUT that rolled back after
+// renaming its blob into place leaks a file nothing will ever select — but
+// that is rare, and a full tree walk is the one genuinely expensive thing
+// the sweeper can do. It does not belong on the reclaim cadence.
+var orphanSweepInterval = time.Hour
+
+// sweepOrphansIfDue runs the orphan walk at most once per
+// orphanSweepInterval. Blobs younger than TmpMaxAge are spared, which is the
+// same bound a live upload gets: a PUT holding an uncommitted rename for
+// longer than that has already lost its temp file too.
+func (s *Store) sweepOrphansIfDue(ctx context.Context, res *SweepResult) error {
+	now := time.Now()
+	last := s.lastOrphanSweep.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < orphanSweepInterval {
+		return nil
+	}
+	if !s.lastOrphanSweep.CompareAndSwap(last, now.UnixNano()) {
+		return nil // another sweep got there first
+	}
+	n, err := s.SweepOrphans(ctx, now.Add(-s.cfg.TmpMaxAge))
+	res.Orphans += n
+	return err
 }
 
 type candidate struct{ bucket, hash string }
@@ -169,18 +196,35 @@ func (s *Store) stageOrRemove(c candidate) error {
 		}
 		return nil
 	}
-	if err := os.MkdirAll(s.trashDir(c.bucket), 0o755); err != nil {
-		return fmt.Errorf("create trash dir: %w", err)
+	_, err := s.moveToTrash(c.bucket, c.hash, src)
+	return err
+}
+
+// moveToTrash stages a reclaimed blob and starts its retention clock.
+//
+// The mtime reset is load-bearing. rename(2) preserves mtime, so a trashed
+// file otherwise keeps the time it was *written*, not the time it became
+// garbage — and any blob older than -trash-retention would be expired by the
+// very sweep that trashed it. The recovery net would then be absent for
+// exactly the long-lived objects that need it most. This is the same mistake
+// the design rejected in "mtime-based grace"; moving the file does not fix
+// it on its own.
+func (s *Store) moveToTrash(bucket, hash, src string) (bool, error) {
+	if err := os.MkdirAll(s.trashDir(bucket), 0o755); err != nil {
+		return false, fmt.Errorf("create trash dir: %w", err)
 	}
-	// mtime in trash means "when the blob became garbage", which is exactly
-	// what the retention clock needs and what a blob's own mtime cannot say.
-	if err := os.Rename(src, s.trashPath(c.bucket, c.hash)); err != nil {
+	dst := s.trashPath(bucket, hash)
+	if err := os.Rename(src, dst); err != nil {
 		if os.IsNotExist(err) {
-			return nil // already gone; the row removal still stands
+			return false, nil // already gone; the row removal still stands
 		}
-		return fmt.Errorf("move reclaimed blob to trash: %w", err)
+		return false, fmt.Errorf("move reclaimed blob to trash: %w", err)
 	}
-	return nil
+	now := time.Now()
+	if err := os.Chtimes(dst, now, now); err != nil {
+		return false, fmt.Errorf("start retention clock on %s: %w", dst, err)
+	}
+	return true, nil
 }
 
 // expireTrash unlinks trash entries past the retention window and accumulates
@@ -228,6 +272,10 @@ func (s *Store) cleanTmp(ctx context.Context, res *SweepResult) error {
 // it belong to in-flight PUTs and are left alone, which is what lets the walk
 // run in the background instead of blocking startup.
 func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, error) {
+	// Recorded for both callers, so the startup walk and the first periodic
+	// sweep do not walk the tree twice at boot.
+	s.lastOrphanSweep.Store(time.Now().UnixNano())
+
 	blobsRoot := filepath.Join(s.dataDir, "blobs")
 
 	// The guard. Without it a lost or replaced meta.db — wrong volume
@@ -279,7 +327,7 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 		}
 		if moved {
 			reclaimed++
-			startupOrphansDeleted.Inc()
+			orphansReclaimed.Inc()
 		}
 		return nil
 	})
@@ -310,13 +358,8 @@ func (s *Store) reclaimOrphan(ctx context.Context, bucket, hash, path string) (b
 		return false, nil // adopted while we walked; leave it alone
 	}
 
-	if err := os.MkdirAll(s.trashDir(bucket), 0o755); err != nil {
-		return false, err
-	}
-	if err := os.Rename(path, s.trashPath(bucket, hash)); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
+	moved, err := s.moveToTrash(bucket, hash, path)
+	if err != nil || !moved {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

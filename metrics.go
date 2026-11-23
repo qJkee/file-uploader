@@ -80,22 +80,33 @@ var (
 		Help: "Bytes currently held in trash.",
 	})
 
-	startupOrphansDeleted = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "objectstore_startup_orphans_deleted_total",
-		Help: "Blobs with no row moved to trash by the startup walk.",
+	// Not "startup": the walk runs once at boot and then periodically, since
+	// a PUT that rolls back after renaming its blob into place leaks a file
+	// the reclaim anti-join can never see.
+	orphansReclaimed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "objectstore_orphans_reclaimed_total",
+		Help: "Blobs with no blobs row moved to trash by the orphan walk.",
 	})
 )
 
+// observeSweep records what the sweep actually did, whether or not it also
+// returned an error. The three passes run independently so one unmovable
+// file cannot stop the others — discarding their counts here would undo
+// that, and sweepDeletedTotal is a counter, so a skipped increment is lost
+// for good rather than caught up on the next pass.
 func observeSweep(res SweepResult, err error, seconds float64) {
 	sweepDuration.Observe(seconds)
+	sweepCandidates.Set(float64(res.Candidates))
+	sweepDeletedTotal.Add(float64(res.Reclaimed))
+	// res.Orphans is not added here: SweepOrphans counts its own reclaims,
+	// because the startup walk does not come through a sweep at all.
+	trashFiles.Set(float64(res.TrashFiles))
+	trashBytes.Set(float64(res.TrashBytes))
+
 	if err != nil {
 		sweepRunsTotal.WithLabelValues("error").Inc()
 		return
 	}
 	sweepRunsTotal.WithLabelValues("success").Inc()
 	sweepLastSuccess.SetToCurrentTime()
-	sweepCandidates.Set(float64(res.Candidates))
-	sweepDeletedTotal.Add(float64(res.Reclaimed))
-	trashFiles.Set(float64(res.TrashFiles))
-	trashBytes.Set(float64(res.TrashBytes))
 }

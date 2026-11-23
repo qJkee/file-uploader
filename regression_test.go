@@ -209,6 +209,118 @@ func TestObjectsAreNotSniffed(t *testing.T) {
 	}
 }
 
+// TestTrashRetentionClockStartsAtReclaim: rename(2) preserves mtime, so a
+// trashed file keeps the time it was *written*, not the time it became
+// garbage. Without resetting it, any blob older than the retention window is
+// unlinked by the very same sweep that trashed it — the recovery net is
+// absent for exactly the long-lived objects that need it.
+func TestTrashRetentionClockStartsAtReclaim(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.TrashRetention = time.Hour
+
+	const body = "uploaded long ago"
+	mustPut(t, s, "b1", "a", body)
+	hash := hashOf(body)
+	long := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(s.blobPath("b1", hash), long, long); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	res := mustSweep(t, s)
+
+	if res.Reclaimed != 1 {
+		t.Fatalf("Reclaimed = %d, want 1", res.Reclaimed)
+	}
+	if _, err := os.Stat(s.trashPath("b1", hash)); err != nil {
+		t.Errorf("a blob reclaimed seconds ago is already gone from trash: %v", err)
+	}
+	if res.TrashDeleted != 0 {
+		t.Errorf("TrashDeleted = %d, want 0 — the retention clock must start at reclaim", res.TrashDeleted)
+	}
+}
+
+// TestPeriodicSweepCollectsRowlessOrphans: a rollback after the blob is
+// renamed into place leaves a file with no blobs row. The reclaim anti-join
+// only sees blobs that *have* a row, so without a periodic orphan pass that
+// file leaks for the whole life of the process — no crash required.
+func TestPeriodicSweepCollectsRowlessOrphans(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.TmpMaxAge = time.Hour
+	mustPut(t, s, "b1", "survivor", "survivor") // the empty-table guard needs a row
+
+	orphan := writeOrphanBlob(t, s, "b1", "leaked by a rolled-back put")
+	long := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(orphan, long, long); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	res := mustSweep(t, s)
+
+	if res.Orphans != 1 {
+		t.Errorf("Orphans = %d, want 1", res.Orphans)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("a row-less blob survived a periodic sweep: %v", err)
+	}
+	if got := mustGet(t, s, "b1", "survivor"); got != "survivor" {
+		t.Errorf("survivor = %q — the pass must not touch referenced blobs", got)
+	}
+}
+
+// TestPeriodicSweepSparesRecentOrphans: an in-flight PUT has already renamed
+// its blob into place and has not committed yet. The pass must not race it.
+func TestPeriodicSweepSparesRecentOrphans(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.TmpMaxAge = time.Hour
+	mustPut(t, s, "b1", "survivor", "survivor")
+	orphan := writeOrphanBlob(t, s, "b1", "written just now")
+
+	res := mustSweep(t, s)
+
+	if res.Orphans != 0 {
+		t.Errorf("Orphans = %d, want 0", res.Orphans)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("a blob younger than TmpMaxAge was reclaimed: %v", err)
+	}
+}
+
+// TestSweepMetricsSurviveAPartialFailure: the three passes deliberately run
+// independently, so one unmovable file must not discard the counts of
+// everything that did succeed. sweep_deleted_total is a counter — a skipped
+// increment is lost permanently.
+func TestSweepMetricsSurviveAPartialFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: chmod does not deny access")
+	}
+	s := newTestStore(t)
+	s.cfg.TrashRetention = time.Hour
+	before := testutil.ToFloat64(sweepDeletedTotal)
+
+	for _, body := range []string{"stuck", "movable"} {
+		mustPut(t, s, "b1", body, body)
+		if err := s.Delete(t.Context(), "b1", body, Precondition{}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+	stuckDir := s.blobDir("b1", hashOf("stuck"))
+	if err := os.Chmod(stuckDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(stuckDir, 0o755) })
+
+	if _, err := s.Sweep(t.Context()); err == nil {
+		t.Fatal("Sweep = nil error, want the unmovable blob reported")
+	}
+
+	if got := testutil.ToFloat64(sweepDeletedTotal) - before; got != 1 {
+		t.Errorf("sweep_deleted_total delta = %v, want 1 — the successful reclaim was discarded", got)
+	}
+}
+
 // TestRepeatedIfMatchHeaderLines: RFC 9110 §5.3 makes two header lines
 // equivalent to one comma-separated list, so a legitimate write must not get
 // a spurious 412.

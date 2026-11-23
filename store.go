@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -91,6 +92,10 @@ type Store struct {
 	cfg     Config
 	db      *sql.DB
 	dataDir string
+
+	// Unix nanos of the last orphan walk; 0 means never. Sweep may run from
+	// more than one goroutine, so this is atomic.
+	lastOrphanSweep atomic.Int64
 
 	// Test seams, nil in production. hookBeforeCommit fires inside Put's
 	// transaction after the blob is renamed into place; hookGetMiss fires in
