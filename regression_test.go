@@ -1,5 +1,8 @@
 package main
 
+// Tests pinning defects found in the whole-branch review: each one failed
+// against the code as first written.
+
 import (
 	"bytes"
 	"fmt"
