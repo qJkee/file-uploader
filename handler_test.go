@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -66,7 +67,10 @@ func TestStatusFor(t *testing.T) {
 		{"blob missing", ErrBlobMissing, http.StatusInternalServerError},
 		{"disk full", syscall.ENOSPC, http.StatusInsufficientStorage},
 		{"client gone", context.Canceled, 0},
-		{"unknown", io.ErrUnexpectedEOF, http.StatusInternalServerError},
+		{"connection reset", syscall.ECONNRESET, 0},
+		{"broken pipe", syscall.EPIPE, 0},
+		{"truncated body", io.ErrUnexpectedEOF, 0},
+		{"unknown", errors.New("something else"), http.StatusInternalServerError},
 	}
 	for _, c := range cases {
 		if got := statusFor(c.err); got != c.want {

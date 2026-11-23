@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -129,6 +131,13 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	// "*", comma-separated lists and weak comparison, which is why the 304 is
 	// not answered by hand. The cost is one open() even on a 304.
 	w.Header().Set("ETag", etagOf(hash))
+	// An object is opaque and is never parsed, so its own bytes must not be
+	// allowed to choose their Content-Type. Letting ServeContent sniff would
+	// let anyone who can PUT serve scripted HTML from this origin, and this
+	// service has no authentication of its own. Setting the type also stops
+	// ServeContent from sniffing at all.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, "", time.Time{}, f)
 }
 
@@ -154,14 +163,14 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 // If-None-Match is not read here: http.ServeContent handles it.
 func writePreconditions(r *http.Request) (Precondition, bool) {
 	var pre Precondition
-	if v := r.Header.Get("If-Match"); v != "" {
+	if v := joinHeader(r, "If-Match"); v != "" {
 		list, ok := parseTagList(v)
 		if !ok {
 			return pre, false
 		}
 		pre.IfMatch = list
 	}
-	if v := r.Header.Get("If-None-Match"); v != "" {
+	if v := joinHeader(r, "If-None-Match"); v != "" {
 		list, ok := parseTagList(v)
 		if !ok {
 			return pre, false
@@ -169,6 +178,13 @@ func writePreconditions(r *http.Request) (Precondition, bool) {
 		pre.IfNoneMatch = list
 	}
 	return pre, true
+}
+
+// joinHeader folds repeated header lines into one list value. RFC 9110 §5.3
+// makes two If-Match lines equivalent to one comma-separated list, so
+// reading only the first would turn a legitimate write into a spurious 412.
+func joinHeader(r *http.Request, name string) string {
+	return strings.Join(r.Header.Values(name), ", ")
 }
 
 // precheck is the advisory half of the precondition evaluation. A missing
@@ -199,6 +215,12 @@ func etagOf(hash string) string { return `"` + hash + `"` }
 // fail writes the status statusFor chose and logs what the operator needs.
 func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	status := statusFor(err)
+	// The request's own context is cancelled as soon as the connection goes
+	// away, which catches aborts whose error value is some transport type we
+	// did not enumerate.
+	if r.Context().Err() != nil {
+		status = 0
+	}
 	if status == 0 {
 		// The client hung up. Nothing committed, the temp is gone, and there
 		// is no one left to read a response.
@@ -241,7 +263,13 @@ func statusFor(err error) int {
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, syscall.ENOSPC):
 		return http.StatusInsufficientStorage
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, io.ErrUnexpectedEOF):
+		// The upload was aborted at the socket — a phone losing signal, a
+		// cancelled curl. There is no one left to read a response, and it is
+		// not a server error.
 		return 0
 	case errors.As(err, &sqliteErr) &&
 		(sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED):

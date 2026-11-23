@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -21,6 +22,7 @@ var sweepLimit = 1000
 type SweepResult struct {
 	Candidates   int
 	Reclaimed    int
+	Failed       int
 	TrashDeleted int
 	TmpDeleted   int
 	TrashFiles   int
@@ -36,16 +38,16 @@ func (s *Store) Sweep(ctx context.Context) (res SweepResult, err error) {
 	start := time.Now()
 	defer func() { observeSweep(res, err, time.Since(start).Seconds()) }()
 
-	if err = s.reclaim(ctx, &res); err != nil {
-		return res, err
-	}
-	if err = s.expireTrash(ctx, &res); err != nil {
-		return res, err
-	}
-	if err = s.cleanTmp(ctx, &res); err != nil {
-		return res, err
-	}
-	return res, nil
+	// Every pass runs even if an earlier one failed. One blob the sweeper
+	// cannot move — wrong ownership after an operator chown, an EIO — must
+	// not stop trash expiry and temp cleanup too, or a single bad file leaks
+	// disk without bound.
+	err = errors.Join(
+		s.reclaim(ctx, &res),
+		s.expireTrash(ctx, &res),
+		s.cleanTmp(ctx, &res),
+	)
+	return res, err
 }
 
 type candidate struct{ bucket, hash string }
@@ -55,31 +57,45 @@ type candidate struct{ bucket, hash string }
 // batch per interval and take days.
 func (s *Store) reclaim(ctx context.Context, res *SweepResult) error {
 	deadline := time.Now().Add(s.cfg.SweepBudget)
+	var firstErr error
 	for {
 		if time.Now().After(deadline) {
-			return nil
+			break
 		}
 		batch, err := s.reclaimCandidates(ctx)
 		if err != nil {
-			return err
+			return errors.Join(firstErr, err)
 		}
 		res.Candidates += len(batch)
+		progress := 0
 		for _, c := range batch {
 			if err := ctx.Err(); err != nil {
-				return err
+				return errors.Join(firstErr, err)
 			}
 			ok, err := s.reclaimOne(ctx, c)
-			if err != nil {
-				return err
-			}
-			if ok {
+			switch {
+			case err != nil:
+				// One unmovable candidate is counted and skipped, not
+				// escalated: the query has no ORDER BY, so returning here
+				// would hand back the same row forever and stall reclamation
+				// of everything behind it.
+				res.Failed++
+				if firstErr == nil {
+					firstErr = err
+				}
+			case ok:
 				res.Reclaimed++
+				progress++
 			}
 		}
-		if len(batch) < sweepLimit {
-			return nil
+		if len(batch) < sweepLimit || progress == 0 {
+			break // short batch, or nothing movable left to make progress on
 		}
 	}
+	if firstErr != nil {
+		return fmt.Errorf("%d candidate(s) could not be reclaimed, first: %w", res.Failed, firstErr)
+	}
+	return nil
 }
 
 // reclaimCandidates is an indexed anti-join over a small table, not a
@@ -254,20 +270,59 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 		if known {
 			return nil
 		}
-		if err := os.MkdirAll(s.trashDir(bucket), 0o755); err != nil {
+		if s.hookOrphanWindow != nil {
+			s.hookOrphanWindow()
+		}
+		moved, err := s.reclaimOrphan(ctx, bucket, hash, path)
+		if err != nil {
 			return err
 		}
-		if err := os.Rename(path, s.trashPath(bucket, hash)); err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
+		if moved {
+			reclaimed++
+			startupOrphansDeleted.Inc()
 		}
-		reclaimed++
-		startupOrphansDeleted.Inc()
 		return nil
 	})
 	return reclaimed, err
+}
+
+// reclaimOrphan moves one orphan under the write lock. The re-check inside
+// the transaction is what makes it safe: the walk's own read happened
+// outside any lock, and a PUT of exactly these bytes — the idempotent retry
+// a client makes after the crash that created the orphan — can commit a row
+// in between. Without the re-check that PUT ends up with a committed row
+// pointing at a file now sitting in trash: a permanent 500 on every read,
+// and the one alert the whole locking design exists to keep at zero.
+func (s *Store) reclaimOrphan(ctx context.Context, bucket, hash, path string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var known bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = ? AND hash = ?)`,
+		bucket, hash).Scan(&known); err != nil {
+		return false, err
+	}
+	if known {
+		return false, nil // adopted while we walked; leave it alone
+	}
+
+	if err := os.MkdirAll(s.trashDir(bucket), 0o755); err != nil {
+		return false, err
+	}
+	if err := os.Rename(path, s.trashPath(bucket, hash)); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // parseBlobPath reverses blobPath: blobs/{bucket}/{hh}/{hash}. A file that

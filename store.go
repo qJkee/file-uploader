@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"syscall"
 	"time"
 
@@ -96,6 +97,60 @@ type Store struct {
 	// Get between the failed open and the re-read of the row.
 	hookBeforeCommit func()
 	hookGetMiss      func()
+	// hookOrphanWindow fires in the startup walk's window where a concurrent
+	// PUT could adopt the blob about to be reclaimed.
+	hookOrphanWindow func()
+}
+
+// missingAncestors lists the directories of path that do not exist yet,
+// outermost first, including path itself.
+func missingAncestors(path string) ([]string, error) {
+	var missing []string
+	for p := filepath.Clean(path); ; {
+		_, err := os.Stat(p)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		missing = append(missing, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break // reached the root
+		}
+		p = parent
+	}
+	slices.Reverse(missing)
+	return missing, nil
+}
+
+// mkdirAllSync creates path and makes every directory it had to create
+// durable. Plain MkdirAll is not enough for the blob tree: renameDurable
+// fsyncs the directory holding the blob, which persists the file's entry
+// within its fanout directory — but the fanout directory's own entry, and a
+// new bucket directory's entry, would still be unflushed. Power loss could
+// then drop the whole directory while the committed row survived, which is
+// exactly the "row pointing at nothing" this ordering exists to prevent.
+func mkdirAllSync(path string, perm os.FileMode) error {
+	missing, err := missingAncestors(path)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(path, perm); err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	// A directory entry is made durable by syncing the directory that holds
+	// it, so each created directory needs its parent synced.
+	for _, dir := range missing {
+		if err := fsyncDir(filepath.Dir(dir)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // openDB opens meta.db with every per-connection pragma in the DSN. They
@@ -262,8 +317,8 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 
 	hash := hex.EncodeToString(digest.Sum(nil))
 	res := PutResult{Hash: hash, Size: size}
-	if err := os.MkdirAll(s.blobDir(bucket, hash), 0o755); err != nil {
-		return PutResult{}, fmt.Errorf("create blob dir: %w", err)
+	if err := mkdirAllSync(s.blobDir(bucket, hash), 0o755); err != nil {
+		return PutResult{}, err
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB

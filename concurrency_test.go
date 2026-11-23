@@ -240,7 +240,12 @@ func TestDiskFullIs507(t *testing.T) {
 	}
 }
 
-func TestClientDisconnectMidPut(t *testing.T) {
+// TestPutCleansUpOnContextCancellation is the deterministic half of the
+// client-disconnect story: the store's own cleanup. It does NOT cover the
+// HTTP behaviour — it hands Put the one error value the code special-cases.
+// TestRealClientDisconnectMidPut aborts a real socket and is what pins "no
+// 5xx".
+func TestPutCleansUpOnContextCancellation(t *testing.T) {
 	s := newTestStore(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
