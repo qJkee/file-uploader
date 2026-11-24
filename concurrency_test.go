@@ -27,7 +27,7 @@ func assertConsistent(t *testing.T, s *Store, blobMissingBefore float64) {
 	t.Helper()
 
 	// 1. Every objects row has a readable file at its derived path.
-	rows, err := s.DB().Query(`SELECT bucket, object_id, hash FROM objects`)
+	rows, err := s.Pool().Query(t.Context(), `SELECT bucket, object_id, hash FROM objects`)
 	if err != nil {
 		t.Fatalf("query objects: %v", err)
 	}
@@ -58,8 +58,8 @@ func assertConsistent(t *testing.T, s *Store, blobMissingBefore float64) {
 			return nil
 		}
 		var known bool
-		if err := s.DB().QueryRow(
-			`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = ? AND hash = ?)`,
+		if err := s.Pool().QueryRow(t.Context(),
+			`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = $1 AND hash = $2)`,
 			bucket, hash).Scan(&known); err != nil {
 			return err
 		}
@@ -154,7 +154,7 @@ func TestIdenticalContentStorm(t *testing.T) {
 		t.Errorf("blob files = %d, want 1", got)
 	}
 	var blobs int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobs); err != nil {
+	if err := s.Pool().QueryRow(t.Context(), `SELECT count(*) FROM blobs`).Scan(&blobs); err != nil {
 		t.Fatal(err)
 	}
 	if blobs != 1 {
@@ -278,13 +278,9 @@ func cancelAfter(cancel context.CancelFunc) error {
 // TestLostDatabase is the disaster the orphan walk's guard exists for: the
 // metadata is gone, so every blob must be left exactly where it is.
 func TestLostDatabase(t *testing.T) {
-	dir := t.TempDir()
-	cfg := Config{
-		DataDir: dir, MaxObjectSize: 1 << 20, SweepInterval: time.Minute,
-		SweepBudget: time.Second, TmpMaxAge: time.Hour, TrashRetention: 24 * time.Hour,
-	}
+	cfg := newTestConfig(t)
 
-	first, err := Open(cfg)
+	first, err := Open(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -292,18 +288,13 @@ func TestLostDatabase(t *testing.T) {
 		mustPut(t, first, "b1", fmt.Sprintf("o%d", i), fmt.Sprintf("body-%d", i))
 	}
 	beforeFiles := countBlobFiles(t, first)
-	if err := first.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	first.Close()
 
-	if err := os.Remove(filepath.Join(dir, "meta.db")); err != nil {
-		t.Fatalf("remove meta.db: %v", err)
-	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		os.Remove(filepath.Join(dir, "meta.db"+suffix))
-	}
+	// The metadata is gone: a wrong -database-url, a bad restore, a dropped
+	// schema. Open recreates an empty one, which is the dangerous case.
+	execOnDatabase(t, cfg.DatabaseURL, `DROP TABLE objects, blobs`)
 
-	second, err := Open(cfg)
+	second, err := Open(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -317,20 +308,13 @@ func TestLostDatabase(t *testing.T) {
 		t.Errorf("reclaimed = %d, want 0 — the walk must be skipped", n)
 	}
 	if got := countBlobFiles(t, second); got != beforeFiles {
-		t.Errorf("blob files = %d, want %d — a lost meta.db must destroy nothing", got, beforeFiles)
+		t.Errorf("blob files = %d, want %d — lost metadata must destroy nothing", got, beforeFiles)
 	}
 }
 
 func BenchmarkPut(b *testing.B) {
 	run := func(b *testing.B, unique bool) {
-		s, err := Open(Config{
-			DataDir: b.TempDir(), MaxObjectSize: 1 << 20, SweepInterval: time.Minute,
-			SweepBudget: time.Second, TmpMaxAge: time.Hour, TrashRetention: time.Hour,
-		})
-		if err != nil {
-			b.Fatal(err)
-		}
-		defer s.Close()
+		s := newTestStore(b)
 		payload := strings.Repeat("x", 4096)
 
 		b.ResetTimer()

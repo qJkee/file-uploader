@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-# Pure-Go SQLite means no cgo, which is what makes a scratch image possible.
+# Pure-Go pgx means no cgo, which is what makes a scratch image possible.
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /objectstore .
 
 # Staged here because scratch has no shell to mkdir with, and / is root-owned
@@ -26,4 +26,6 @@ USER 65532:65532
 # device check catches that at boot rather than per request.
 VOLUME /data
 EXPOSE 8080
-ENTRYPOINT ["/objectstore", "-data", "/data", "-addr", ":8080"]
+ENV OBJECTSTORE_DATA=/data \
+    OBJECTSTORE_ADDR=:8080
+ENTRYPOINT ["/objectstore"]

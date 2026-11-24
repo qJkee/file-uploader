@@ -171,3 +171,78 @@ plain FK-liveness check, since Postgres cannot turn foreign keys off.
 - Whether schema creation runs on every boot (as today) or once; today's
   `CREATE TABLE IF NOT EXISTS` on startup is fine to keep.
 - A `compose.yaml` for local development, if it helps.
+
+## Outcome
+
+Measured by `TestSweepDoesNotStarveWriters` (`contention_test.go`): 8 workers
+PUTting to distinct keys plus 4 concurrent readers, for 6 s against one
+`httptest.Server`, with and without a concurrent `Sweep` draining a backlog
+of 60,000 unreferenced blobs. SQLite's rows are the original audit.
+
+**Compare down each column within one engine, never across the two.** The two
+baselines were taken on different stacks (see caveat 1); SQLite's 1837 next to
+Postgres's 798 is not a 2.3× regression, it is two unrelated environments. The
+ratio of each engine's drain row to its own baseline is the result.
+
+| | PUTs | PUT p50 | PUT p95 | PUT p99 | PUT max |
+|---|---|---|---|---|---|
+| SQLite — *its own baseline* | 1837 | 23 ms | 43 ms | 117 ms | 571 ms |
+| SQLite, during drain | **99** (5%) | 189 ms | 2.25 s | 3.37 s | 3.44 s |
+| Postgres — *its own baseline* | 798 | 60 ms | 80 ms | 93 ms | 113 ms |
+| Postgres, during drain | **781** (98%) | 61 ms | 82 ms | 95 ms | 117 ms |
+
+Reads were not measured in the original audit; they are here because a writer
+blocked in the database holds one of the pool's 10 connections.
+
+| | GETs | GET p50 | GET p95 | GET p99 | GET max |
+|---|---|---|---|---|---|
+| Postgres, baseline | 14008 | 0.7 ms | 7 ms | 23 ms | 43 ms |
+| Postgres, during drain | 14775 | 0.7 ms | 6 ms | 22 ms | 42 ms |
+
+A sibling test, `TestSweepDoesNotStarveDatabaseWrites`, drives the same
+transaction shape with no file I/O, which raises the write rate from ~130/s
+to ~1350/s and makes Postgres rather than the disk the bottleneck. That is
+where the database contention this migration was bought to fix is actually
+visible:
+
+| | writes/s | p50 | p95 | p99 |
+|---|---|---|---|---|
+| baseline | 1358 | 5.6 ms | 8.3 ms | 14 ms |
+| during drain | 1250 (92%) | 6.1 ms | 8.8 ms | 13 ms |
+
+**The goal was met**, on both measurements. Throughput during the drain is
+98% of baseline where SQLite kept 5%, and p99 is unchanged where SQLite's
+rose 29×. No request failed in either phase. The drain reclaimed 319 blobs
+during the window, so the sweeper really was working.
+
+Methodology, because two details move the number materially:
+
+- **A 2 s warm-up phase runs first and is discarded, and the baseline phase
+  always runs before the drain phase.** Without the warm-up the baseline pays
+  for opening the pool's 10 connections and filling their statement caches,
+  and the drain comes out 9–12% *faster* than the baseline it is supposed to
+  be degraded against. Removing that bias moved the headline from a
+  flattering 108% to an honest 98%.
+- **The tables above are from a plain run.** The suite runs under `-race`,
+  where the conclusion holds (ratio 0.95–0.99) but absolute GET counts drop
+  ~40%, since GETs are CPU-bound and PUTs are not. Across eight runs — plain,
+  under `-race`, and under eight CPU hogs — the PUT ratio stayed between 0.95
+  and 1.14.
+
+Three caveats, in `.superpowers/sdd/2026-11-24-postgres-migration/task-6-report.md`
+in full:
+
+1. **Absolute numbers are not comparable across engines.** Postgres here runs
+   in a Docker VM and the end-to-end measurement is dominated by macOS
+   `F_FULLFSYNC`, not by the database. Only the baseline→drain ratio carries.
+2. **The sweeper, not the request path, is now the thing that gets starved.**
+   Reclaim runs at ~1300/s idle but ~50/s under this load, and clients orphan
+   blobs at ~130/s, so garbage outruns reclamation under sustained overwrite
+   traffic. Disk leaks; nothing breaks. Not addressed here.
+3. **The throughput and latency assertions are blunt, and do not carry the
+   test.** Re-adding a global write lock to `reclaimOne` leaves throughput at
+   96% of baseline end-to-end and 82% database-only, because a sweeper
+   throttled to ~50 reclaims/s cannot starve anyone. What catches it on any
+   hardware is a poll of `pg_locks` for client backends queued on a relation
+   lock on `blobs`, asserted to stay at zero: 0 on `main`, 7–8 with the lock
+   reintroduced.

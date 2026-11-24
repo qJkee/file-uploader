@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,6 +76,72 @@ func TestEnvFallback(t *testing.T) {
 
 		if err := envFallback(fs, "OBJECTSTORE_"); err == nil {
 			t.Error("envFallback = nil, want an error naming the variable")
+		}
+	})
+}
+
+func TestRequiredFlags(t *testing.T) {
+	t.Run("run with no args and no env reports missing -data", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATA", "")
+		os.Unsetenv("OBJECTSTORE_DATA")
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
+		err := run([]string{})
+		if !errors.Is(err, errDataRequired) {
+			t.Errorf("error = %v, want errDataRequired", err)
+		}
+	})
+}
+
+func TestDatabaseURLIsRequired(t *testing.T) {
+	t.Run("run rejects empty database URL", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
+		dir := t.TempDir()
+		err := run([]string{"-data", dir})
+		if !errors.Is(err, errDatabaseURLRequired) {
+			t.Errorf("error = %v, want errDatabaseURLRequired", err)
+		}
+	})
+
+	t.Run("run rejects whitespace-only database URL", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
+		dir := t.TempDir()
+		err := run([]string{"-data", dir, "-database-url", "  \t\n  "})
+		if !errors.Is(err, errDatabaseURLRequired) {
+			t.Errorf("error = %v, want errDatabaseURLRequired", err)
+		}
+	})
+
+	t.Run("Open rejects empty database URL", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := Open(context.Background(), Config{
+			DataDir:     dir,
+			DatabaseURL: "",
+		})
+		if err == nil {
+			t.Fatal("Open with empty DatabaseURL succeeded; want an error")
+		}
+		if !strings.Contains(err.Error(), "database") && !strings.Contains(err.Error(), "url") {
+			t.Errorf("error = %q, want it to mention database url", err)
+		}
+	})
+
+	t.Run("Open rejects whitespace-only database URL", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := Open(context.Background(), Config{
+			DataDir:     dir,
+			DatabaseURL: "  \t\n  ",
+		})
+		if err == nil {
+			t.Fatal("Open with whitespace-only DatabaseURL succeeded; want an error")
+		}
+		if !strings.Contains(err.Error(), "database") && !strings.Contains(err.Error(), "url") {
+			t.Errorf("error = %q, want it to mention database url", err)
 		}
 	})
 }

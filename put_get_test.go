@@ -206,7 +206,8 @@ func TestGetRetryDeleted(t *testing.T) {
 	mustPut(t, s, "b1", "a", "hello")
 	unlinkBlob(t, s, "b1", "hello")
 	s.hookGetMiss = func() {
-		if _, err := s.db.Exec(`DELETE FROM objects WHERE bucket='b1' AND object_id='a'`); err != nil {
+		if _, err := s.Pool().Exec(t.Context(),
+			`DELETE FROM objects WHERE bucket='b1' AND object_id='a'`); err != nil {
 			t.Errorf("hook delete: %v", err)
 		}
 	}
@@ -222,8 +223,8 @@ func TestGetRetryOverwritten(t *testing.T) {
 	mustPut(t, s, "b1", "other", "world") // puts hash(world) on disk
 	unlinkBlob(t, s, "b1", "hello")
 	s.hookGetMiss = func() {
-		if _, err := s.db.Exec(
-			`UPDATE objects SET hash = ? WHERE bucket='b1' AND object_id='a'`,
+		if _, err := s.Pool().Exec(t.Context(),
+			`UPDATE objects SET hash = $1 WHERE bucket='b1' AND object_id='a'`,
 			hashOf("world")); err != nil {
 			t.Errorf("hook update: %v", err)
 		}

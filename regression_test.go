@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -49,6 +50,94 @@ func TestOrphanWalkDoesNotStealAnAdoptedBlob(t *testing.T) {
 	if n != 0 {
 		t.Errorf("reclaimed = %d, want 0 — the blob was adopted by a concurrent PUT", n)
 	}
+	if got := mustGet(t, s, "b1", "retried"); got != body {
+		t.Errorf("Get = %q, want %q", got, body)
+	}
+}
+
+// TestOrphanWalkDoesNotStealABlobAdoptedMidTransaction covers the second,
+// narrower window: the one *inside* reclaimOrphan's transaction, between its
+// decision that the blob is unknown and the rename into trash.
+//
+// TestOrphanWalkDoesNotStealAnAdoptedBlob above cannot reach it.
+// hookOrphanWindow fires before the transaction opens, so the racing PUT has
+// already committed by the time the transaction starts and any re-check at
+// all catches it. Under SQLite's `_txlock=immediate` that was the only
+// interleaving there was: the whole transaction was mutually exclusive with
+// every writer. Under Postgres a plain SELECT takes no row lock and there is
+// no row to lock, so the PUT can commit *after* the check and still have its
+// bytes renamed away — which is why reclaimOrphan now claims the row instead
+// of reading it.
+func TestOrphanWalkDoesNotStealABlobAdoptedMidTransaction(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "survivor", "survivor") // the guard needs a non-empty blobs table
+
+	const body = "bytes from the crashed put"
+	orphan := writeOrphanBlob(t, s, "b1", body)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(orphan, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Buffered and never cancelled: if an assertion below aborts the test
+	// while the PUT is still blocked, the goroutine must not wedge on a send.
+	raced := make(chan error, 1)
+	ctx := context.WithoutCancel(t.Context())
+	var once sync.Once
+	s.hookOrphanRecheck = func() {
+		once.Do(func() {
+			go func() {
+				_, err := s.Put(ctx, "b1", "retried", strings.NewReader(body), Precondition{})
+				raced <- err
+			}()
+			// Hand control back to the rename only once that PUT is
+			// observably blocked on our claim. The 2s bound is safely under
+			// lock_timeout=5s: giving up fails the test cleanly instead of
+			// surfacing as a confusing 55P03.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				select {
+				case err := <-raced:
+					raced <- err // the assertions below still want it
+					t.Error("the racing PUT committed without ever blocking: " +
+						"reclaimOrphan is not holding the blobs key, so the rename " +
+						"below is about to steal a live object's bytes")
+					return
+				default:
+				}
+				var blocked int
+				if err := s.Pool().QueryRow(ctx,
+					`SELECT count(*) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0`,
+				).Scan(&blocked); err != nil {
+					t.Errorf("poll pg_stat_activity: %v", err)
+					return
+				}
+				if blocked > 0 {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			t.Error("deadline expired: the racing PUT was never observed blocked, so this test proved nothing")
+		})
+	}
+
+	n, err := s.SweepOrphans(t.Context(), time.Now())
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+	// The claim is taken before the hook, so the sweeper always wins this
+	// ordering. A 0 here would mean the PUT got in first and the hard window
+	// was never entered.
+	if n != 1 {
+		t.Fatalf("reclaimed = %d, want 1 — the sweeper claimed the row first, so it must win", n)
+	}
+
+	if err := <-raced; err != nil {
+		t.Fatalf("racing PUT: %v", err)
+	}
+	// The whole point: the client was told 201, so the object must be
+	// readable, with its own bytes. Losing the race must cost the PUT a
+	// re-write of the file, never the object.
 	if got := mustGet(t, s, "b1", "retried"); got != body {
 		t.Errorf("Get = %q, want %q", got, body)
 	}
@@ -328,8 +417,8 @@ func TestSweepMetricsSurviveAPartialFailure(t *testing.T) {
 // capping memory.
 func TestConnectionPoolIsBounded(t *testing.T) {
 	s := newTestStore(t)
-	if got := s.DB().Stats().MaxOpenConnections; got != maxOpenConns {
-		t.Errorf("MaxOpenConnections = %d, want %d", got, maxOpenConns)
+	if got := s.Pool().Stat().MaxConns(); got != maxConns {
+		t.Errorf("MaxConns = %d, want %d", got, maxConns)
 	}
 }
 
@@ -477,5 +566,157 @@ func TestRepeatedIfMatchHeaderLines(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200 — either tag matching is enough", resp.StatusCode)
+	}
+}
+
+func allPut(int) string { return http.MethodPut }
+
+// putOrDelete makes the even writers update and the odd ones delete.
+func putOrDelete(i int) string {
+	if i%2 == 0 {
+		return http.MethodPut
+	}
+	return http.MethodDelete
+}
+
+// concurrentWrites fires 16 writes at one path, all carrying the same
+// precondition, and returns each writer's status beside the body it sent —
+// empty for the DELETE writers, which send none. method picks writer i's
+// verb. 16 rather than TestLostUpdatePrevented's 2 because two writers under
+// READ COMMITTED serialise by accident often enough to hide a missing lock.
+func concurrentWrites(t *testing.T, ts *testServer, path string, header http.Header, method func(i int) string) (statuses []int, bodies []string) {
+	t.Helper()
+	const n = 16
+	statuses, bodies = make([]int, n), make([]string, n)
+	start := make(chan struct{})
+	var warm, wg sync.WaitGroup
+	for i := range n {
+		warm.Add(1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A HEAD first: it goes through the same pgxpool as the write, so
+			// by the time the barrier opens the pool's connections are
+			// already open. Opening one costs far more than the window under
+			// test, so without this the writers arrive too scattered to
+			// overlap and the bug hides about half the time. (The HTTP
+			// connections do not survive: httptest's client caps idle
+			// connections per host at 2.) Deferred, because ts.do calls
+			// t.Fatalf on a transport error and a missed warm.Done would hang
+			// the package rather than fail it.
+			func() {
+				defer warm.Done()
+				ts.do(t, http.MethodHead, path, nil, nil)
+			}()
+			<-start // release them together, so the windows actually overlap
+			if method(i) == http.MethodDelete {
+				statuses[i] = ts.do(t, http.MethodDelete, path, nil, header).StatusCode
+				return
+			}
+			bodies[i] = fmt.Sprintf("writer-%02d", i)
+			statuses[i] = ts.do(t, http.MethodPut, path, strings.NewReader(bodies[i]), header).StatusCode
+		}()
+	}
+	warm.Wait()
+	close(start)
+	wg.Wait()
+	return statuses, bodies
+}
+
+// TestConcurrentIfMatchPicksOneWinner: every writer read the same ETag, so
+// exactly one may win. Without the per-key lock the precondition read and the
+// write sit in different snapshots and several writers pass the check.
+func TestConcurrentIfMatchPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
+
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-Match", etag), allPut)
+
+	winner, wins, conflicts := "", 0, 0
+	for i, st := range statuses {
+		switch {
+		case st >= 200 && st < 300:
+			wins++
+			winner = bodies[i]
+		case st == http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d: status %d, want 2xx or 412", i, st)
+		}
+	}
+	if want := len(statuses) - 1; wins != 1 || conflicts != want {
+		t.Fatalf("got %d winners and %d conflicts, want 1 and %d — a second winner is a lost update", wins, conflicts, want)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
+		t.Errorf("stored body = %q, want the winner's %q", got, winner)
+	}
+}
+
+// TestConcurrentCreateOnlyPicksOneWinner: If-None-Match: * is create-only, so
+// of 16 writers racing for one absent path exactly one may create it. This is
+// the case SELECT ... FOR UPDATE cannot cover — there is no row to lock.
+func TestConcurrentCreateOnlyPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-None-Match", "*"), allPut)
+
+	winner, created, conflicts := "", 0, 0
+	for i, st := range statuses {
+		switch st {
+		case http.StatusCreated:
+			created++
+			winner = bodies[i]
+		case http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d: status %d, want 201 or 412", i, st)
+		}
+	}
+	if want := len(statuses) - 1; created != 1 || conflicts != want {
+		t.Fatalf("got %d creations and %d conflicts, want 1 and %d — create-only let a second writer through", created, conflicts, want)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
+		t.Errorf("stored body = %q, want the creator's %q", got, winner)
+	}
+}
+
+// TestConcurrentIfMatchDeleteAndPutPicksOneWinner: Delete takes the same
+// per-key lock as Put and needs it for the same reason, but neither test
+// above issues a DELETE, so dropping that call would go unnoticed. Sixteen
+// clients hold one ETag, half updating and half deleting: without the lock a
+// DELETE reads h1, passes its precondition, and then removes a row a
+// concurrent PUT has already moved to h2 — a lost update with nothing left
+// behind, and two clients both told they succeeded.
+func TestConcurrentIfMatchDeleteAndPutPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
+
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-Match", etag), putOrDelete)
+
+	winner, wins, conflicts := -1, 0, 0
+	for i, st := range statuses {
+		switch {
+		case st >= 200 && st < 300:
+			wins++
+			winner = i
+		case st == http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d (%s): status %d, want 2xx or 412", i, putOrDelete(i), st)
+		}
+	}
+	if want := len(statuses) - 1; wins != 1 || conflicts != want {
+		t.Fatalf("got %d winners and %d conflicts, want 1 and %d — writers holding one ETag both wrote", wins, conflicts, want)
+	}
+
+	resp := ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)
+	if putOrDelete(winner) == http.MethodDelete {
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("writer %d deleted the object, but GET = %d, want 404", winner, resp.StatusCode)
+		}
+		return
+	}
+	if got := readBody(t, resp); got != bodies[winner] {
+		t.Errorf("stored body = %q, want the winner's %q", got, bodies[winner])
 	}
 }
