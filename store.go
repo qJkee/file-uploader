@@ -105,9 +105,13 @@ type Store struct {
 	// Get between the failed open and the re-read of the row.
 	hookBeforeCommit func()
 	hookGetMiss      func()
-	// hookOrphanWindow fires in the startup walk's window where a concurrent
-	// PUT could adopt the blob about to be reclaimed.
-	hookOrphanWindow func()
+	// hookOrphanWindow fires in the startup walk before reclaimOrphan opens
+	// its transaction; hookOrphanRecheck fires inside it, between the claim
+	// on the blobs row and the rename into trash. They are two different
+	// windows a concurrent PUT can land in and only the second one needs the
+	// claim to be safe.
+	hookOrphanWindow  func()
+	hookOrphanRecheck func()
 }
 
 // missingAncestors lists the directories of path that do not exist yet,
@@ -199,9 +203,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	// against runaway queries; every statement in this service is short, as
 	// file streaming does not touch the database.
 	//
-	// Under pool saturation a request can wait up to statement_timeout for a
-	// connection (the transitive bound: statement_timeout caps how long any
-	// connection stays occupied). There is no hard acquire timeout.
+	// Neither bounds how long a pool acquire can wait, and there is no hard
+	// acquire timeout. statement_timeout does not even bound how long a
+	// connection stays occupied: Put holds its transaction across
+	// renameDurable's rename and fsync, when no statement is running and the
+	// timeout is not counting. The real bound on an acquire is the slowest
+	// in-flight request, disk included.
 	if poolCfg.ConnConfig.RuntimeParams == nil {
 		poolCfg.ConnConfig.RuntimeParams = make(map[string]string)
 	}
@@ -493,6 +500,9 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 		return ErrNotFound
 	}
 
+	// RowsAffected is deliberately not checked: lockObjectKey serialises every
+	// writer on this key, so between the SELECT above and here nothing can
+	// have removed the row, and a zero would be unreachable.
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM objects WHERE bucket = $1 AND object_id = $2`,
 		bucket, objectID); err != nil {

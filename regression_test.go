@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -49,6 +50,94 @@ func TestOrphanWalkDoesNotStealAnAdoptedBlob(t *testing.T) {
 	if n != 0 {
 		t.Errorf("reclaimed = %d, want 0 — the blob was adopted by a concurrent PUT", n)
 	}
+	if got := mustGet(t, s, "b1", "retried"); got != body {
+		t.Errorf("Get = %q, want %q", got, body)
+	}
+}
+
+// TestOrphanWalkDoesNotStealABlobAdoptedMidTransaction covers the second,
+// narrower window: the one *inside* reclaimOrphan's transaction, between its
+// decision that the blob is unknown and the rename into trash.
+//
+// TestOrphanWalkDoesNotStealAnAdoptedBlob above cannot reach it.
+// hookOrphanWindow fires before the transaction opens, so the racing PUT has
+// already committed by the time the transaction starts and any re-check at
+// all catches it. Under SQLite's `_txlock=immediate` that was the only
+// interleaving there was: the whole transaction was mutually exclusive with
+// every writer. Under Postgres a plain SELECT takes no row lock and there is
+// no row to lock, so the PUT can commit *after* the check and still have its
+// bytes renamed away — which is why reclaimOrphan now claims the row instead
+// of reading it.
+func TestOrphanWalkDoesNotStealABlobAdoptedMidTransaction(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "survivor", "survivor") // the guard needs a non-empty blobs table
+
+	const body = "bytes from the crashed put"
+	orphan := writeOrphanBlob(t, s, "b1", body)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(orphan, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Buffered and never cancelled: if an assertion below aborts the test
+	// while the PUT is still blocked, the goroutine must not wedge on a send.
+	raced := make(chan error, 1)
+	ctx := context.WithoutCancel(t.Context())
+	var once sync.Once
+	s.hookOrphanRecheck = func() {
+		once.Do(func() {
+			go func() {
+				_, err := s.Put(ctx, "b1", "retried", strings.NewReader(body), Precondition{})
+				raced <- err
+			}()
+			// Hand control back to the rename only once that PUT is
+			// observably blocked on our claim. The 2s bound is safely under
+			// lock_timeout=5s: giving up fails the test cleanly instead of
+			// surfacing as a confusing 55P03.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				select {
+				case err := <-raced:
+					raced <- err // the assertions below still want it
+					t.Error("the racing PUT committed without ever blocking: " +
+						"reclaimOrphan is not holding the blobs key, so the rename " +
+						"below is about to steal a live object's bytes")
+					return
+				default:
+				}
+				var blocked int
+				if err := s.Pool().QueryRow(ctx,
+					`SELECT count(*) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0`,
+				).Scan(&blocked); err != nil {
+					t.Errorf("poll pg_stat_activity: %v", err)
+					return
+				}
+				if blocked > 0 {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			t.Error("deadline expired: the racing PUT was never observed blocked, so this test proved nothing")
+		})
+	}
+
+	n, err := s.SweepOrphans(t.Context(), time.Now())
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+	// The claim is taken before the hook, so the sweeper always wins this
+	// ordering. A 0 here would mean the PUT got in first and the hard window
+	// was never entered.
+	if n != 1 {
+		t.Fatalf("reclaimed = %d, want 1 — the sweeper claimed the row first, so it must win", n)
+	}
+
+	if err := <-raced; err != nil {
+		t.Fatalf("racing PUT: %v", err)
+	}
+	// The whole point: the client was told 201, so the object must be
+	// readable, with its own bytes. Losing the race must cost the PUT a
+	// re-write of the file, never the object.
 	if got := mustGet(t, s, "b1", "retried"); got != body {
 		t.Errorf("Get = %q, want %q", got, body)
 	}
