@@ -40,10 +40,15 @@ const (
 // audit's without making the measurement about bandwidth.
 var contentionPayload = strings.Repeat("x", 256)
 
-// seedBacklog inserts n unreferenced blobs rows and writes the files they
-// name, bypassing Put entirely: 60k real PUTs would take far longer than the
-// whole test, and reclaim only needs a row to delete and a file to move.
-func seedBacklog(t *testing.T, s *Store, n int) {
+// seedBacklog inserts n unreferenced blobs rows, bypassing Put entirely:
+// 60k real PUTs would take far longer than the whole test, and reclaim only
+// needs a row to delete and a file to move.
+//
+// withFiles writes the files those rows name. Without them reclaim still
+// takes its full database path — moveToTrash just finds nothing to rename
+// and reclaimOne commits anyway — which is what the database-only sibling
+// test wants.
+func seedBacklog(t *testing.T, s *Store, n int, withFiles bool) {
 	t.Helper()
 
 	hashes := make([]string, n)
@@ -60,6 +65,9 @@ func seedBacklog(t *testing.T, s *Store, n int) {
 		t.Fatalf("seed blobs rows: %v", err)
 	}
 
+	if !withFiles {
+		return
+	}
 	for i := range 256 {
 		dir := s.blobDir(drainBucket, fmt.Sprintf("%02x", i))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -140,18 +148,64 @@ func (p phase) row(kind string, d []time.Duration, fail int) string {
 		dur(pct(d, 0.50)), dur(pct(d, 0.95)), dur(pct(d, 0.99)), dur(pct(d, 1.0)))
 }
 
-// poolWait reports how much of a phase was spent queueing for one of the
-// pool's 10 connections. Row locks never collide on Postgres, so the shared
-// pool is the one route by which a sweeper can slow the request path — and
-// this turns out to be the most sensitive instrument in the test (see
-// TestSweepDoesNotStarveWriters' comment on what it catches).
+// poolWait reports how much of a phase was spent blocked because every one
+// of the pool's 10 connections was busy. Row locks never collide on
+// Postgres, so the shared pool is the one route by which a sweeper can slow
+// the request path.
+//
+// EmptyAcquireWaitTime, not AcquireDuration: the latter totals every
+// successful acquire whether it waited or not, so it is dominated by ~10 µs
+// of per-acquire bookkeeping and its floor scales with request count rather
+// than with contention.
 func poolWait(t *testing.T, name string, before, after *pgxpool.Stat) time.Duration {
 	t.Helper()
-	total := after.AcquireDuration() - before.AcquireDuration()
-	t.Logf("%-10s pool: %d acquires, %d had to wait, %v total wait", name,
+	waited := after.EmptyAcquireWaitTime() - before.EmptyAcquireWaitTime()
+	t.Logf("%-10s pool: %d acquires, %d found the pool empty, %v spent waiting", name,
 		after.AcquireCount()-before.AcquireCount(),
-		after.EmptyAcquireCount()-before.EmptyAcquireCount(), total.Round(time.Millisecond))
-	return total
+		after.EmptyAcquireCount()-before.EmptyAcquireCount(), waited.Round(time.Millisecond))
+	return waited
+}
+
+// watchBlobsLockQueue samples pg_locks for backends queued on a *relation*
+// lock on blobs, and returns the peak depth seen.
+//
+// This is the test's one calibration-free instrument. Every other assertion
+// here is a wall-clock number that holds on one laptop; a client backend
+// stuck behind `LOCK TABLE blobs` appears in this queue on any hardware,
+// however fast or slow, because it is the mechanism rather than a symptom of
+// it. Row locks — which are all this design should ever take on blobs — are
+// tuples, not relations, and never appear here.
+//
+// It samples rather than integrates: a lock held for microseconds at a time
+// can be missed, so a non-zero reading is strong evidence and a zero reading
+// is weak. That asymmetry is the right way round for an assertion that must
+// not flake.
+func watchBlobsLockQueue(t *testing.T, s *Store, done <-chan struct{}) <-chan int {
+	t.Helper()
+	peak := make(chan int, 1)
+	go func() {
+		ctx := context.WithoutCancel(t.Context())
+		worst := 0
+		for {
+			select {
+			case <-done:
+				peak <- worst
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			var queued int
+			// to_regclass, not a cast: the per-test schema is dropped during
+			// cleanup and a cast to a missing relation would error.
+			if err := s.Pool().QueryRow(ctx, `
+				SELECT count(*) FROM pg_locks
+				WHERE NOT granted AND locktype = 'relation'
+				  AND relation = to_regclass('blobs')`).Scan(&queued); err != nil {
+				continue // the pool is busy or shutting down; not our business
+			}
+			worst = max(worst, queued)
+		}
+	}()
+	return peak
 }
 
 // timeRequest issues one request and reports how long it took end to end.
@@ -283,7 +337,7 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	}
 	// Seeded before the baseline, not between the phases, so the sweeper is
 	// the only thing that differs between them.
-	seedBacklog(t, s, contentionBacklog)
+	seedBacklog(t, s, contentionBacklog, true)
 
 	// Discarded: without it the baseline pays for opening the pool's ten
 	// connections, filling their statement caches and growing the Go heap,
@@ -321,17 +375,28 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 
 	before := backlogRows(t, s)
 	statDrain := s.Pool().Stat()
+	watching := make(chan struct{})
+	lockQueue := watchBlobsLockQueue(t, s, watching)
 	drain := runPhase(t, ts, client, "drain", contentionWindow)
+	close(watching)
+	peakLockQueue := <-lockQueue
 	drainWait := poolWait(t, "drain", statDrain, s.Pool().Stat())
 	drain.drained = before - backlogRows(t, s)
 
 	stopDrain()
 	<-swept
-	// The cancellation above is the only error a healthy drain produces: it
-	// aborts whichever reclaimOne was in flight, which reclaim counts as one
-	// failed candidate.
+	// errors.Is is not enough on its own: reclaim returns
+	// errors.Join(firstErr, ctx.Err()), so a sweep in which every candidate
+	// failed with EIO still matches context.Canceled. Failed is the honest
+	// check, and its bound is exact rather than calibrated — cancelling can
+	// abort at most the one reclaimOne in flight before the loop's next
+	// ctx.Err() check.
 	if sweepErr != nil && !errors.Is(sweepErr, context.Canceled) {
 		t.Errorf("Sweep: %v", sweepErr)
+	}
+	if sweepRes.Failed > 1 {
+		t.Errorf("the drain failed on %d candidates (want <= 1, the one cancellation "+
+			"aborts): %v", sweepRes.Failed, sweepErr)
 	}
 
 	t.Logf("%-10s %-4s %7s %8s %9s %9s %9s %9s", "phase", "op", "count", "failed", "p50", "p95", "p99", "max")
@@ -341,31 +406,42 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	t.Log(drain.row("GET", drain.gets, drain.getFail))
 	t.Logf("PUT throughput: %.0f/s baseline, %.0f/s during the drain (%.0f%% of baseline)",
 		base.putRate(), drain.putRate(), 100*drain.putRate()/base.putRate())
-	t.Logf("drain: %d blobs reclaimed during the window (%.0f/s), %d total this sweep",
-		drain.drained, float64(drain.drained)/drain.elapsed.Seconds(), sweepRes.Reclaimed)
+	t.Logf("drain: %d blobs reclaimed during the window (%.0f/s); whole sweep "+
+		"reclaimed %d of %d candidates, %d failed; peak blobs lock queue %d",
+		drain.drained, float64(drain.drained)/drain.elapsed.Seconds(),
+		sweepRes.Reclaimed, sweepRes.Candidates, sweepRes.Failed, peakLockQueue)
 	t.Log("SQLite, same shape: 1837 -> 99 PUTs (5% of baseline), p99 117ms -> 3.37s")
 
-	// The two sensitive instruments. The latency and throughput bounds below
-	// are the ones the brief asked for, but they are blunt: re-adding a
-	// global write lock (`LOCK TABLE blobs IN EXCLUSIVE MODE` in reclaimOne)
-	// leaves PUT throughput at 96% of baseline and p99 at 115 ms, because
-	// macOS F_FULLFSYNC throttles the sweeper to ~50 reclaims/s and a lock
-	// taken 50 times a second cannot starve anyone. These two do catch it:
-	// with that lock in place the drain managed 127 reclaims instead of
-	// 313-331, and cumulative pool wait went from 0.6-1.0s to 5.3s.
-	//
-	// Both bounds are calibrated on one laptop with Postgres in Docker. If
-	// they flake on other hardware, relax them and say so — do not delete
-	// them, or the test goes back to being unable to fail.
-	if drain.drained < 200 {
-		t.Errorf("the drain reclaimed only %d blobs during the window (want >= 200, "+
-			"typical is ~320); either the sweeper never ran, or something is blocking it",
+	// The assertion that carries this test, and the only one here that needs
+	// no calibration. The client-visible bounds further down are blunt:
+	// re-adding a global write lock (`LOCK TABLE blobs IN EXCLUSIVE MODE` in
+	// reclaimOne) leaves PUT throughput at 96% of baseline and p99 at 115 ms,
+	// because macOS F_FULLFSYNC throttles the sweeper to ~50 reclaims/s and a
+	// lock taken 50 times a second cannot starve anyone. A slower sweeper
+	// makes those bounds *more* forgiving, which is backwards. This one gets
+	// sharper instead: the slower the sweeper, the longer each client backend
+	// sits in the queue.
+	if peakLockQueue > 0 {
+		t.Errorf("%d client backend(s) were queued on a relation lock on blobs during "+
+			"the drain, want 0 — reclaim is taking a table-level lock, which is the "+
+			"SQLite behaviour this migration removed", peakLockQueue)
+	}
+	// Loose sanity floor only: a sweeper that got no candidates at all, or
+	// one wedged outright, would make everything above vacuous. Deliberately
+	// 6x below the ~320 this laptop sustains, because the rate varies with
+	// the disk by an order of magnitude and this must not be the thing that
+	// fails on a slower machine.
+	if drain.drained < 50 {
+		t.Errorf("the drain reclaimed only %d blobs during the window (want >= 50); "+
+			"the sweeper was not really running, so this measurement proves nothing",
 			drain.drained)
 	}
+	// Not an assertion: the floor scales with the machine, and the pg_locks
+	// check above covers the regression this would have caught.
 	if drainWait > 2500*time.Millisecond {
-		t.Errorf("requests spent %v queueing for a pool connection during the drain "+
-			"(want < 2.5s, typical is 0.6-1.0s); the sweeper is holding connections "+
-			"the request path needs", drainWait.Round(time.Millisecond))
+		t.Logf("NOTE: requests spent %v blocked on an empty pool during the drain "+
+			"(typically well under 1s here); worth a look",
+			drainWait.Round(time.Millisecond))
 	}
 	// SQLite shed ~1% of a hot key's requests as 503 under its busy handler.
 	// Row locks mean there is nothing here for a client write to lose to.
@@ -396,5 +472,150 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	// far below the 5s lock_timeout a genuine stall would sit on.
 	if got := pct(drain.gets, 0.99); got > 250*time.Millisecond {
 		t.Errorf("GET p99 during the drain is %v, want < 250ms — the drain is starving reads", got)
+	}
+}
+
+// dbWriteWindow drives Put's *database* shape — advisory lock, precondition
+// read, both upserts, commit — with no file I/O at all, for window, and
+// returns the sorted latencies.
+func dbWriteWindow(t *testing.T, s *Store, window time.Duration) []time.Duration {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	per := make([][]time.Duration, contentionWriters)
+	errs := make([]error, contentionWriters)
+
+	var wg sync.WaitGroup
+	for w := range contentionWriters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := fmt.Sprintf("writer-%d", w)
+			for i := 0; time.Now().Before(deadline); i++ {
+				start := time.Now()
+				errs[w] = cmp.Or(errs[w], dbWriteOnce(t.Context(), s, key, hashOf(fmt.Sprintf("%s-%d", key, i))))
+				per[w] = append(per[w], time.Since(start))
+			}
+		}()
+	}
+	wg.Wait()
+
+	var all []time.Duration
+	for w := range per {
+		if errs[w] != nil {
+			t.Fatalf("writer %d: %v", w, errs[w])
+		}
+		all = append(all, per[w]...)
+	}
+	slices.Sort(all)
+	return all
+}
+
+func dbWriteOnce(ctx context.Context, s *Store, key, hash string) error {
+	tx, err := s.Pool().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+
+	if err := lockObjectKey(ctx, tx, liveBucket, key); err != nil {
+		return err
+	}
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT hash FROM objects WHERE bucket = $1 AND object_id = $2`,
+		liveBucket, key).Scan(&current); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO blobs (bucket, hash) VALUES ($1, $2)
+		 ON CONFLICT (bucket, hash) DO UPDATE SET hash = excluded.hash`, liveBucket, hash); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO objects (bucket, object_id, hash) VALUES ($1, $2, $3)
+		 ON CONFLICT (bucket, object_id) DO UPDATE SET hash = excluded.hash`,
+		liveBucket, key, hash); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// TestSweepDoesNotStarveDatabaseWrites is the sibling that measures Postgres
+// rather than APFS.
+//
+// TestSweepDoesNotStarveWriters goes through HTTP and Put, where a request
+// costs ~60 ms of which the database is ~5 ms. That bounds total request
+// cost, which is the right thing to promise a client — but it means a
+// Postgres that got three times slower under a drain would move p99 from
+// 60 ms to 70 ms and sail through a 30% slack. Since database contention is
+// the entire thing this migration was bought to fix, it needs a measurement
+// that can see it.
+//
+// So: the same transaction shape with the fsyncs removed, which raises the
+// write rate from ~130/s to ~2000/s and makes the database the bottleneck.
+// The assertion is a ratio of p99 to p99, so it needs no calibration and
+// does not care how fast the host is.
+func TestSweepDoesNotStarveDatabaseWrites(t *testing.T) {
+	const window = 4 * time.Second
+
+	cfg := newTestConfig(t)
+	cfg.SweepBudget = 4 * window
+	s := openTestStore(t, cfg)
+	// No files: this test is about what the database does. Reclaim still
+	// runs its full transaction per blob.
+	seedBacklog(t, s, 20000, false)
+	s.lastOrphanSweep.Store(time.Now().UnixNano())
+
+	dbWriteWindow(t, s, time.Second) // discarded, as in the sibling test
+	base := dbWriteWindow(t, s, window)
+
+	drainCtx, stopDrain := context.WithCancel(context.WithoutCancel(t.Context()))
+	defer stopDrain()
+	swept := make(chan struct{})
+	var sweepRes SweepResult
+	go func() {
+		defer close(swept)
+		sweepRes, _ = s.Sweep(drainCtx)
+	}()
+	for start := time.Now(); backlogRows(t, s) == 20000; {
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("the drain reclaimed nothing in 10s; the measurement would be meaningless")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	before := backlogRows(t, s)
+	watching := make(chan struct{})
+	lockQueue := watchBlobsLockQueue(t, s, watching)
+	drain := dbWriteWindow(t, s, window)
+	close(watching)
+	peakLockQueue := <-lockQueue
+	drained := before - backlogRows(t, s)
+	stopDrain()
+	<-swept
+
+	rate := func(d []time.Duration) float64 { return float64(len(d)) / window.Seconds() }
+	t.Logf("db-only writes: %.0f/s baseline, %.0f/s during the drain (%.0f%% of baseline)",
+		rate(base), rate(drain), 100*rate(drain)/rate(base))
+	t.Logf("db-only p50 %v -> %v, p95 %v -> %v, p99 %v -> %v",
+		dur(pct(base, 0.5)), dur(pct(drain, 0.5)), dur(pct(base, 0.95)), dur(pct(drain, 0.95)),
+		dur(pct(base, 0.99)), dur(pct(drain, 0.99)))
+	t.Logf("drain reclaimed %d during the window (%.0f/s), %d total; peak blobs lock queue %d",
+		drained, float64(drained)/window.Seconds(), sweepRes.Reclaimed, peakLockQueue)
+
+	if peakLockQueue > 0 {
+		t.Errorf("%d client backend(s) were queued on a relation lock on blobs during "+
+			"the drain, want 0", peakLockQueue)
+	}
+	if drained < 200 {
+		t.Errorf("the drain reclaimed only %d rows during the window (want >= 200); "+
+			"the sweeper was not really running", drained)
+	}
+	// The two ratios. Both are calibration-free: they compare two windows of
+	// the same work on the same machine, minutes apart.
+	if got := rate(drain) / rate(base); got < 0.70 {
+		t.Errorf("database write throughput during the drain is %.0f%% of baseline, want >= 70%%",
+			100*got)
+	}
+	if got := float64(pct(drain, 0.99)) / float64(pct(base, 0.99)); got > 2.5 {
+		t.Errorf("database write p99 rose %.1fx during the drain (%v -> %v), want <= 2.5x",
+			got, dur(pct(base, 0.99)), dur(pct(drain, 0.99)))
 	}
 }
