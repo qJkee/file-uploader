@@ -338,3 +338,109 @@ func TestTrashRecoveryPath(t *testing.T) {
 		t.Errorf("recovered object = %q, want %q", got, "hello")
 	}
 }
+
+// TestReclaimSkipsAdoptedBlob exercises the race where a concurrent PUT holds
+// an uncommitted objects row that blocks the sweeper's DELETE, then commits
+// while the DELETE waits. Under READ COMMITTED the DELETE's NOT EXISTS reads a
+// snapshot from before the commit, but the FK trigger sees current data. This
+// raises SQLSTATE 23503. The correct response is (false, nil): the blob was
+// adopted, leave it.
+func TestReclaimSkipsAdoptedBlob(t *testing.T) {
+	s := newTestStore(t)
+	hash := hashOf("adopted")
+
+	// Create a blob candidate: a blobs row and file, but no objects row.
+	mustPut(t, s, "b1", "temp", "adopted")
+	if err := s.Delete(t.Context(), "b1", "temp", Precondition{}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Open a transaction and insert the objects row, but do not commit yet.
+	// This holds a FOR KEY SHARE lock on the blobs row.
+	blocker, err := s.Pool().Begin(t.Context())
+	if err != nil {
+		t.Fatalf("begin blocker tx: %v", err)
+	}
+	defer blocker.Rollback(t.Context())
+
+	var blockerPID int
+	if err := blocker.QueryRow(t.Context(), `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatalf("get blocker backend pid: %v", err)
+	}
+
+	if _, err := blocker.Exec(t.Context(),
+		`INSERT INTO objects (bucket, object_id, hash) VALUES ('b1', 'adopted', $1)`,
+		hash); err != nil {
+		t.Fatalf("insert uncommitted objects row: %v", err)
+	}
+
+	// Run the sweep in a goroutine. The DELETE will block on the row lock.
+	done := make(chan SweepResult)
+	sweepErr := make(chan error, 1)
+	go func() {
+		res, err := s.Sweep(t.Context())
+		sweepErr <- err
+		done <- res
+	}()
+
+	// Poll until a backend is blocked specifically by our blocker transaction.
+	deadline := time.Now().Add(5 * time.Second)
+	foundBlocked := false
+	for time.Now().Before(deadline) {
+		var blocked int
+		if err := s.Pool().QueryRow(t.Context(),
+			`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`,
+			blockerPID).Scan(&blocked); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if blocked > 0 {
+			foundBlocked = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !foundBlocked {
+		t.Fatal("deadline expired: the DELETE was never observed blocked on a lock — the race did not trigger, so this test proved nothing")
+	}
+
+	// Commit the blocker. The DELETE unblocks, and the FK trigger sees the
+	// now-committed objects row -> 23503.
+	if err := blocker.Commit(t.Context()); err != nil {
+		t.Fatalf("commit blocker: %v", err)
+	}
+
+	// Wait for the sweep to complete.
+	if err := <-sweepErr; err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	res := <-done
+
+	// The blob was adopted, so it must survive.
+	if _, err := os.Stat(s.blobPath("b1", hash)); err != nil {
+		t.Errorf("blob file is missing: %v — a 23503 must leave the file alone", err)
+	}
+	var blobExists bool
+	if err := s.Pool().QueryRow(t.Context(),
+		`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = 'b1' AND hash = $1)`,
+		hash).Scan(&blobExists); err != nil {
+		t.Fatalf("check blobs row: %v", err)
+	}
+	if !blobExists {
+		t.Error("blobs row was deleted despite the foreign-key violation")
+	}
+
+	// A 23503 that surfaced as an error would be the bug: the sweeper must
+	// treat it as a lost race, not a failure.
+	if res.Failed != 0 {
+		t.Errorf("Failed = %d, want 0 — a 23503 must return (false, nil), not an error", res.Failed)
+	}
+	if res.Reclaimed != 0 {
+		t.Errorf("Reclaimed = %d, want 0 — the blob was adopted", res.Reclaimed)
+	}
+
+	// Verify the object is readable via the adopted row.
+	if got := mustGet(t, s, "b1", "adopted"); got != "adopted" {
+		t.Errorf("adopted object = %q, want %q", got, "adopted")
+	}
+}
