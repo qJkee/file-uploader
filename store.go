@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -164,7 +165,7 @@ func mkdirAllSync(path string, perm os.FileMode) error {
 // here is a refusal to start: the metadata database is the single source of
 // truth and cannot be reconstructed from hash-named files.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
-	if cfg.DatabaseURL == "" {
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		return nil, errors.New("database URL is required")
 	}
 

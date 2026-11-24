@@ -41,7 +41,7 @@ func run(args []string) error {
 	if *data == "" {
 		return errors.New("-data is required")
 	}
-	if *databaseURL == "" {
+	if strings.TrimSpace(*databaseURL) == "" {
 		return errors.New("-database-url is required")
 	}
 

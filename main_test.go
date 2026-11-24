@@ -90,6 +90,17 @@ func TestDatabaseURLIsRequired(t *testing.T) {
 		}
 	})
 
+	t.Run("run rejects whitespace-only database URL", func(t *testing.T) {
+		dir := t.TempDir()
+		err := run([]string{"-data", dir, "-database-url", "  \t\n  "})
+		if err == nil {
+			t.Fatal("run with whitespace-only -database-url succeeded; want an error")
+		}
+		if !strings.Contains(err.Error(), "-database-url") {
+			t.Errorf("error = %q, want it to name -database-url", err)
+		}
+	})
+
 	t.Run("Open rejects empty database URL", func(t *testing.T) {
 		dir := t.TempDir()
 		_, err := Open(context.Background(), Config{
@@ -98,6 +109,20 @@ func TestDatabaseURLIsRequired(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatal("Open with empty DatabaseURL succeeded; want an error")
+		}
+		if !strings.Contains(err.Error(), "database") && !strings.Contains(err.Error(), "url") {
+			t.Errorf("error = %q, want it to mention database url", err)
+		}
+	})
+
+	t.Run("Open rejects whitespace-only database URL", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := Open(context.Background(), Config{
+			DataDir:     dir,
+			DatabaseURL: "  \t\n  ",
+		})
+		if err == nil {
+			t.Fatal("Open with whitespace-only DatabaseURL succeeded; want an error")
 		}
 		if !strings.Contains(err.Error(), "database") && !strings.Contains(err.Error(), "url") {
 			t.Errorf("error = %q, want it to mention database url", err)
