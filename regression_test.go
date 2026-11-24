@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -87,7 +88,7 @@ func TestOrphanWalkDoesNotStealABlobAdoptedMidTransaction(t *testing.T) {
 	s.hookOrphanRecheck = func() {
 		once.Do(func() {
 			go func() {
-				_, err := s.Put(ctx, "b1", "retried", strings.NewReader(body), Precondition{})
+				_, err := s.Put(ctx, "b1", "retried", strings.NewReader(body), etag.Precondition{})
 				raced <- err
 			}()
 			// Hand control back to the rename only once that PUT is
@@ -224,7 +225,7 @@ func TestSweepSurvivesOneUnmovableBlob(t *testing.T) {
 
 	for _, body := range []string{"stuck", "movable"} {
 		mustPut(t, s, "b1", body, body)
-		if err := s.Delete(t.Context(), "b1", body, Precondition{}); err != nil {
+		if err := s.Delete(t.Context(), "b1", body, etag.Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 	}
@@ -314,7 +315,7 @@ func TestTrashRetentionClockStartsAtReclaim(t *testing.T) {
 	if err := os.Chtimes(s.blobPath("b1", hash), long, long); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -391,7 +392,7 @@ func TestSweepMetricsSurviveAPartialFailure(t *testing.T) {
 
 	for _, body := range []string{"stuck", "movable"} {
 		mustPut(t, s, "b1", body, body)
-		if err := s.Delete(t.Context(), "b1", body, Precondition{}); err != nil {
+		if err := s.Delete(t.Context(), "b1", body, etag.Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 	}
@@ -513,7 +514,7 @@ func TestTrashSizeCapEvictsOldestFirst(t *testing.T) {
 	for i, body := range bodies {
 		id := fmt.Sprintf("o%d", i)
 		mustPut(t, s, "b1", id, body)
-		if err := s.Delete(t.Context(), "b1", id, Precondition{}); err != nil {
+		if err := s.Delete(t.Context(), "b1", id, etag.Precondition{}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 		mustSweep(t, s)
@@ -543,7 +544,7 @@ func TestTrashSizeCapDisabledAtZero(t *testing.T) {
 	s.cfg.MaxTrashBytes = 0
 
 	mustPut(t, s, "b1", "a", "some bytes here")
-	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	mustSweep(t, s)

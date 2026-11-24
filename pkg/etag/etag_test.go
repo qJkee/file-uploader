@@ -1,4 +1,4 @@
-package main
+package etag
 
 import (
 	"errors"
@@ -20,20 +20,20 @@ func TestParseTagList(t *testing.T) {
 		{`W/"a", "b"`, &TagList{Tags: []etagEntry{{value: "a", weak: true}, {value: "b"}}}},
 	}
 	for _, c := range cases {
-		got, ok := parseTagList(c.in)
+		got, ok := ParseList(c.in)
 		if !ok {
-			t.Errorf("parseTagList(%q) = not ok, want ok", c.in)
+			t.Errorf("ParseList(%q) = not ok, want ok", c.in)
 			continue
 		}
 		if !reflect.DeepEqual(got, c.want) {
-			t.Errorf("parseTagList(%q) = %+v, want %+v", c.in, got, c.want)
+			t.Errorf("ParseList(%q) = %+v, want %+v", c.in, got, c.want)
 		}
 	}
 
 	malformed := []string{``, `   `, `a`, `"a",`, `"a" "b"`, `"a`, `w/"a"`, `*, "a"`, `"a", *`}
 	for _, in := range malformed {
-		if _, ok := parseTagList(in); ok {
-			t.Errorf("parseTagList(%q) = ok, want malformed", in)
+		if _, ok := ParseList(in); ok {
+			t.Errorf("ParseList(%q) = ok, want malformed", in)
 		}
 	}
 }
@@ -77,7 +77,7 @@ func TestPreconditionCheck(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		err := c.pre.check(c.hash, c.exists)
+		err := c.pre.Check(c.hash, c.exists)
 		if c.wantErr && !errors.Is(err, ErrPrecondition) {
 			t.Errorf("%s: check = %v, want ErrPrecondition", c.name, err)
 		}

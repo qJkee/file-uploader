@@ -1,4 +1,4 @@
-package main
+package etag
 
 import (
 	"errors"
@@ -23,10 +23,10 @@ type TagList struct {
 	Tags []etagEntry
 }
 
-// parseTagList parses an If-Match / If-None-Match value per RFC 9110 §8.8.3.
+// ParseList parses an If-Match / If-None-Match value per RFC 9110 §8.8.3.
 // ok is false for a malformed value, which the handler turns into 400 rather
 // than silently ignoring a precondition the client asked for.
-func parseTagList(v string) (*TagList, bool) {
+func ParseList(v string) (*TagList, bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return nil, false
@@ -66,7 +66,7 @@ type Precondition struct {
 //
 // Evaluated in RFC 9110 §13.2.2 order: If-Match first, then If-None-Match.
 // A missing resource with If-Match present is 412, not 404.
-func (p Precondition) check(curHash string, exists bool) error {
+func (p Precondition) Check(curHash string, exists bool) error {
 	if p.IfMatch != nil {
 		if !exists || !p.IfMatch.matchStrong(curHash) {
 			return fmt.Errorf("%w: If-Match", ErrPrecondition)

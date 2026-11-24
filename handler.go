@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"objectstore/pkg/etag"
 	"strings"
 	"syscall"
 	"time"
@@ -157,17 +158,17 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 
 // writePreconditions parses the headers a write evaluates. GET's
 // If-None-Match is not read here: http.ServeContent handles it.
-func writePreconditions(r *http.Request) (Precondition, bool) {
-	var pre Precondition
+func writePreconditions(r *http.Request) (etag.Precondition, bool) {
+	var pre etag.Precondition
 	if v := joinHeader(r, "If-Match"); v != "" {
-		list, ok := parseTagList(v)
+		list, ok := etag.ParseList(v)
 		if !ok {
 			return pre, false
 		}
 		pre.IfMatch = list
 	}
 	if v := joinHeader(r, "If-None-Match"); v != "" {
-		list, ok := parseTagList(v)
+		list, ok := etag.ParseList(v)
 		if !ok {
 			return pre, false
 		}
@@ -185,18 +186,18 @@ func joinHeader(r *http.Request, name string) string {
 
 // precheck is the advisory half of the precondition evaluation. A missing
 // object is not an error here: Put decides 412-vs-201 authoritatively.
-func (h *Handler) precheck(r *http.Request, bucket, objectID string, pre Precondition) error {
+func (h *Handler) precheck(r *http.Request, bucket, objectID string, pre etag.Precondition) error {
 	if pre.IfMatch == nil && pre.IfNoneMatch == nil {
 		return nil
 	}
 	hash, err := h.store.Head(r.Context(), bucket, objectID)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return pre.check("", false)
+		return pre.Check("", false)
 	case err != nil:
 		return err
 	}
-	return pre.check(hash, true)
+	return pre.Check(hash, true)
 }
 
 func validateNames(bucket, objectID string) error {
@@ -255,7 +256,7 @@ func statusFor(err error) int {
 		return http.StatusOK
 	case errors.Is(err, ErrInvalidName):
 		return http.StatusBadRequest
-	case errors.Is(err, ErrPrecondition):
+	case errors.Is(err, etag.ErrPrecondition):
 		return http.StatusPreconditionFailed
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound

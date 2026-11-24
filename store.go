@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -351,7 +352,7 @@ type PutResult struct {
 // commits, never the reverse. A crash in that window leaves an orphan file,
 // which the sweeper collects; the reverse would leave a row pointing at
 // nothing — a 500 for an object the client was told was stored.
-func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader, pre Precondition) (PutResult, error) {
+func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader, pre etag.Precondition) (PutResult, error) {
 	if err := validateBucket(bucket); err != nil {
 		return PutResult{}, err
 	}
@@ -412,7 +413,7 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	case err != nil:
 		return PutResult{}, err
 	}
-	if err := pre.check(current, !res.Created); err != nil {
+	if err := pre.Check(current, !res.Created); err != nil {
 		return PutResult{}, err
 	}
 
@@ -465,7 +466,7 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 // The transaction is unconditional even though this was one statement before
 // preconditions existed: splitting the SELECT and the DELETE across a
 // transaction boundary would be check-then-act, and DELETE is not a hot path.
-func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precondition) error {
+func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre etag.Precondition) error {
 	if err := validateBucket(bucket); err != nil {
 		return err
 	}
@@ -493,7 +494,7 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 	}
 	// The precondition outranks the 404: RFC 9110 makes a missing resource
 	// with If-Match present a 412.
-	if err := pre.check(hash, exists); err != nil {
+	if err := pre.Check(hash, exists); err != nil {
 		return err
 	}
 	if !exists {

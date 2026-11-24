@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"objectstore/pkg/etag"
 	"strings"
 	"testing"
 
@@ -77,7 +78,7 @@ func TestSweepMetrics(t *testing.T) {
 	before := testutil.ToFloat64(sweepDeletedTotal)
 	beforeRuns := testutil.ToFloat64(sweepRunsTotal.WithLabelValues("success"))
 	mustPut(t, s, "b1", "a", "hello")
-	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,7 @@ import (
 
 func mustPut(t *testing.T, s *Store, bucket, objectID, body string) PutResult {
 	t.Helper()
-	res, err := s.Put(t.Context(), bucket, objectID, strings.NewReader(body), Precondition{})
+	res, err := s.Put(t.Context(), bucket, objectID, strings.NewReader(body), etag.Precondition{})
 	if err != nil {
 		t.Fatalf("Put(%s/%s): %v", bucket, objectID, err)
 	}
@@ -158,10 +159,10 @@ func TestPutEmptyBody(t *testing.T) {
 
 func TestPutRejectsInvalidNames(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Put(t.Context(), "B1", "a", strings.NewReader("x"), Precondition{}); !errors.Is(err, ErrInvalidName) {
+	if _, err := s.Put(t.Context(), "B1", "a", strings.NewReader("x"), etag.Precondition{}); !errors.Is(err, ErrInvalidName) {
 		t.Errorf("Put with an uppercase bucket = %v, want ErrInvalidName", err)
 	}
-	if _, err := s.Put(t.Context(), "b1", "..", strings.NewReader("x"), Precondition{}); !errors.Is(err, ErrInvalidName) {
+	if _, err := s.Put(t.Context(), "b1", "..", strings.NewReader("x"), etag.Precondition{}); !errors.Is(err, ErrInvalidName) {
 		t.Errorf("Put with objectID %q = %v, want ErrInvalidName", "..", err)
 	}
 }
@@ -239,7 +240,7 @@ func TestDeleteRemovesRowNotFile(t *testing.T) {
 	s := newTestStore(t)
 	mustPut(t, s, "b1", "a", "hello")
 
-	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, _, err := s.Get(t.Context(), "b1", "a"); !errors.Is(err, ErrNotFound) {
@@ -252,7 +253,7 @@ func TestDeleteRemovesRowNotFile(t *testing.T) {
 
 func TestDeleteMissing(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.Delete(t.Context(), "b1", "nope", Precondition{}); !errors.Is(err, ErrNotFound) {
+	if err := s.Delete(t.Context(), "b1", "nope", etag.Precondition{}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Delete of a missing object = %v, want ErrNotFound", err)
 	}
 }
@@ -262,7 +263,7 @@ func TestDeleteOneOfTwoSharedIDs(t *testing.T) {
 	mustPut(t, s, "b1", "a", "hello")
 	mustPut(t, s, "b1", "b", "hello")
 
-	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if got := mustGet(t, s, "b1", "b"); got != "hello" {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,7 +141,7 @@ func TestIdenticalContentStorm(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, errs[i] = s.Put(t.Context(), "b1", fmt.Sprintf("obj-%d", i),
-				strings.NewReader("identical bytes"), Precondition{})
+				strings.NewReader("identical bytes"), etag.Precondition{})
 		}()
 	}
 	wg.Wait()
@@ -177,7 +178,7 @@ func TestCrashMidPut(t *testing.T) {
 	s.hookBeforeCommit = func() { panic("simulated crash between rename and commit") }
 	func() {
 		defer func() { _ = recover() }()
-		s.Put(t.Context(), "b1", "doomed", strings.NewReader("doomed bytes"), Precondition{})
+		s.Put(t.Context(), "b1", "doomed", strings.NewReader("doomed bytes"), etag.Precondition{})
 	}()
 	s.hookBeforeCommit = nil
 
@@ -224,7 +225,7 @@ func TestDiskFullIs507(t *testing.T) {
 	s := newTestStore(t)
 
 	_, err := s.Put(t.Context(), "b1", "a",
-		&errReader{remaining: 16, err: syscall.ENOSPC}, Precondition{})
+		&errReader{remaining: 16, err: syscall.ENOSPC}, etag.Precondition{})
 
 	if !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("Put = %v, want ENOSPC", err)
@@ -254,7 +255,7 @@ func TestPutCleansUpOnContextCancellation(t *testing.T) {
 		strings.NewReader("partial"),
 		&errReader{err: cancelAfter(cancel)},
 	)
-	_, err := s.Put(ctx, "b1", "a", body, Precondition{})
+	_, err := s.Put(ctx, "b1", "a", body, etag.Precondition{})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Put = %v, want context.Canceled", err)
@@ -324,7 +325,7 @@ func BenchmarkPut(b *testing.B) {
 				body = fmt.Sprintf("%s-%d", payload, i)
 			}
 			if _, err := s.Put(b.Context(), "b1", fmt.Sprintf("o%d", i),
-				strings.NewReader(body), Precondition{}); err != nil {
+				strings.NewReader(body), etag.Precondition{}); err != nil {
 				b.Fatal(err)
 			}
 		}
