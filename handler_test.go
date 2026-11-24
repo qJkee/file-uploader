@@ -10,6 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type testServer struct {
@@ -76,6 +78,64 @@ func TestStatusFor(t *testing.T) {
 		if got := statusFor(c.err); got != c.want {
 			t.Errorf("statusFor(%s) = %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestStatusForPostgresErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		code string
+		want int
+	}{
+		{"serialization_failure", "40001", http.StatusServiceUnavailable},
+		{"lock_not_available", "55P03", http.StatusServiceUnavailable},
+		{"query_canceled", "57014", http.StatusServiceUnavailable},
+		{"unique_violation", "23505", http.StatusInternalServerError},
+	}
+	for _, c := range cases {
+		err := &pgconn.PgError{Code: c.code}
+		if got := statusFor(err); got != c.want {
+			t.Errorf("statusFor(%s) = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestLockTimeoutActuallyFires(t *testing.T) {
+	ts := newTestServer(t)
+	ctx := t.Context()
+
+	tx1, err := ts.store.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+
+	if _, err := tx1.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, "b1", "hotkey"); err != nil {
+		t.Fatalf("acquire lock in tx1: %v", err)
+	}
+
+	tx2, err := ts.store.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+
+	_, err = tx2.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, "b1", "hotkey")
+	if err == nil {
+		t.Fatal("expected lock timeout, got success")
+	}
+
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected *pgconn.PgError, got %T", err)
+	}
+	if pgErr.Code != "55P03" {
+		t.Errorf("error code = %s, want 55P03 (lock_not_available)", pgErr.Code)
+	}
+
+	status := statusFor(err)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("statusFor(lock timeout) = %d, want 503", status)
 	}
 }
 

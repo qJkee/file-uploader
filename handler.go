@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -239,6 +240,7 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 // cause from whoever is paged.
 func statusFor(err error) int {
 	var maxBytes *http.MaxBytesError
+	var pgErr *pgconn.PgError
 
 	switch {
 	case err == nil:
@@ -264,6 +266,13 @@ func statusFor(err error) int {
 		// cancelled curl. There is no one left to read a response, and it is
 		// not a server error.
 		return 0
+	case errors.As(err, &pgErr):
+		switch pgErr.Code {
+		case "40001", "55P03", "57014":
+			return http.StatusServiceUnavailable
+		default:
+			return http.StatusInternalServerError
+		}
 	default:
 		return http.StatusInternalServerError
 	}
