@@ -12,8 +12,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Handler serves the object API. It owns no state beyond the store and the
@@ -57,7 +55,7 @@ func instrument(method string, next http.Handler) http.Handler {
 // errors, both of which are visible in /metrics.
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	var one int
-	if err := h.store.DB().QueryRowContext(r.Context(), `SELECT 1`).Scan(&one); err != nil {
+	if err := h.store.Pool().QueryRow(r.Context(), `SELECT 1`).Scan(&one); err != nil {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -238,11 +236,9 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 // client is gone and nothing should be written.
 //
 // ENOSPC gets its own code rather than a generic 500 because a 500 hides the
-// cause from whoever is paged; SQLITE_BUSY past busy_timeout is transient and
-// deserves a retryable 503, not a 500.
+// cause from whoever is paged.
 func statusFor(err error) int {
 	var maxBytes *http.MaxBytesError
-	var sqliteErr *sqlite.Error
 
 	switch {
 	case err == nil:
@@ -268,12 +264,6 @@ func statusFor(err error) int {
 		// cancelled curl. There is no one left to read a response, and it is
 		// not a server error.
 		return 0
-	case errors.As(err, &sqliteErr) &&
-		(sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED):
-		// shortcut: this branch has no test, because the driver's error value
-		// is not constructible from outside its package. Upgrade with a real
-		// lock-contention test if 503s ever show up in production.
-		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

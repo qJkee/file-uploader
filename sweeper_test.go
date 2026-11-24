@@ -47,7 +47,7 @@ func TestSweepMovesUnreferencedBlobToTrash(t *testing.T) {
 		t.Errorf("blob is not in trash: %v — reclaim must rename, not unlink", err)
 	}
 	var n int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM blobs`).Scan(&n); err != nil {
+	if err := s.Pool().QueryRow(t.Context(), `SELECT count(*) FROM blobs`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
@@ -285,9 +285,9 @@ func TestOrphanWalkSkipsFilesNewerThanStart(t *testing.T) {
 }
 
 // TestOrphanWalkSkippedWhenBlobsTableEmpty is the guard that stops a lost or
-// replaced meta.db from deleting every object on disk. It is unrecoverable in
-// principle: blob filenames are hashes, so even with the bytes intact the
-// object IDs that pointed at them can never be reconstructed.
+// replaced metadata database from deleting every object on disk. It is
+// unrecoverable in principle: blob filenames are hashes, so even with the
+// bytes intact the object IDs that pointed at them can never be reconstructed.
 func TestOrphanWalkSkippedWhenBlobsTableEmpty(t *testing.T) {
 	s := newTestStore(t)
 	first := writeOrphanBlob(t, s, "b1", "one")
@@ -325,11 +325,12 @@ func TestTrashRecoveryPath(t *testing.T) {
 	if err := os.Rename(s.trashPath("b1", hash), s.blobPath("b1", hash)); err != nil {
 		t.Fatalf("rename back: %v", err)
 	}
-	if _, err := s.DB().Exec(`INSERT INTO blobs (bucket, hash) VALUES ('b1', ?)`, hash); err != nil {
+	if _, err := s.Pool().Exec(t.Context(),
+		`INSERT INTO blobs (bucket, hash) VALUES ('b1', $1)`, hash); err != nil {
 		t.Fatalf("reinsert blob row: %v", err)
 	}
-	if _, err := s.DB().Exec(
-		`INSERT INTO objects (bucket, object_id, hash) VALUES ('b1', 'a', ?)`, hash); err != nil {
+	if _, err := s.Pool().Exec(t.Context(),
+		`INSERT INTO objects (bucket, object_id, hash) VALUES ('b1', 'a', $1)`, hash); err != nil {
 		t.Fatalf("reinsert object row: %v", err)
 	}
 

@@ -25,6 +25,7 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("objectstore", flag.ContinueOnError)
 	addr := fs.String("addr", ":8080", "listen address")
 	data := fs.String("data", "", "data directory (required)")
+	databaseURL := fs.String("database-url", "", "Postgres connection URL for the metadata database (required)")
 	maxObjectSize := fs.Int64("max-object-size", 32<<20, "largest accepted object, in bytes")
 	sweepInterval := fs.Duration("sweep-interval", time.Minute, "how often the sweeper runs")
 	sweepBudget := fs.Duration("sweep-budget", 10*time.Second, "wall-clock cap on one sweep's reclaim loop")
@@ -40,13 +41,22 @@ func run(args []string) error {
 	if *data == "" {
 		return errors.New("-data is required")
 	}
+	if *databaseURL == "" {
+		return errors.New("-database-url is required")
+	}
 
 	// Captured before the server accepts anything, so the orphan walk can
 	// tell a crash leftover from a blob an in-flight PUT is writing now.
 	startedAt := time.Now()
 
-	store, err := Open(Config{
+	// Installed before Open so a Ctrl-C still works while we are waiting on
+	// an unreachable database.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	store, err := Open(ctx, Config{
 		DataDir:        *data,
+		DatabaseURL:    *databaseURL,
 		MaxObjectSize:  *maxObjectSize,
 		SweepInterval:  *sweepInterval,
 		SweepBudget:    *sweepBudget,
@@ -58,9 +68,6 @@ func run(args []string) error {
 		return err
 	}
 	defer store.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		n, err := store.SweepOrphans(ctx, startedAt)

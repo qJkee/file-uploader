@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,7 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // schemaSQL is the whole mapping. There is no BLOB column: the database never
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS blobs (
   bucket TEXT NOT NULL,
   hash   TEXT NOT NULL,           -- sha256 of body, lowercase hex
   PRIMARY KEY (bucket, hash)
-) STRICT;
+);
 
 CREATE TABLE IF NOT EXISTS objects (
   bucket    TEXT NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS objects (
   hash      TEXT NOT NULL,
   PRIMARY KEY (bucket, object_id),
   FOREIGN KEY (bucket, hash) REFERENCES blobs(bucket, hash)
-) STRICT;
+);
 
 CREATE INDEX IF NOT EXISTS objects_by_hash ON objects(bucket, hash);
 `
@@ -50,6 +50,7 @@ CREATE INDEX IF NOT EXISTS objects_by_hash ON objects(bucket, hash);
 // flags and environment.
 type Config struct {
 	DataDir        string
+	DatabaseURL    string
 	MaxObjectSize  int64
 	SweepInterval  time.Duration
 	SweepBudget    time.Duration
@@ -63,7 +64,7 @@ type Config struct {
 var ErrInvalidName = errors.New("invalid name")
 
 // Buckets are lowercase-only because a bucket is a directory name: APFS is
-// case-insensitive by default while SQLite TEXT keys are not, so "Photos" and
+// case-insensitive by default while Postgres text keys are not, so "Photos" and
 // "photos" would be two rows sharing one directory and dedup would merge
 // across them on macOS but not on Linux.
 var bucketRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
@@ -91,7 +92,7 @@ func validateObjectID(id string) error {
 // The database is the only source of truth; the blob tree is immutable data.
 type Store struct {
 	cfg     Config
-	db      *sql.DB
+	pool    *pgxpool.Pool
 	dataDir string
 
 	// Unix nanos of the last orphan walk; 0 means never. Sweep may run from
@@ -159,27 +160,10 @@ func mkdirAllSync(path string, perm os.FileMode) error {
 	return nil
 }
 
-// openDB opens meta.db with every per-connection pragma in the DSN. They
-// cannot go in db.Exec: database/sql pools connections, so an Exec applies to
-// whichever connection served it and silently not the others. foreign_keys
-// especially — SQLite ignores foreign keys when it is off, which is the
-// default, and the constraint the locking design rests on would simply not
-// exist with no error to say so.
-//
-// _txlock=immediate makes every BeginTx a BEGIN IMMEDIATE. SQLite's default
-// is deferred, which takes the write lock only at the first write and turns
-// the in-transaction precondition checks back into check-then-act races.
-func openDB(path string, busyTimeout time.Duration) (*sql.DB, error) {
-	dsn := fmt.Sprintf(
-		"file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)",
-		path, busyTimeout.Milliseconds())
-	return sql.Open("sqlite", dsn)
-}
-
 // Open prepares the data directory and the metadata database. Every failure
-// here is a refusal to start: meta.db is the single source of truth and
-// cannot be reconstructed from hash-named files.
-func Open(cfg Config) (*Store, error) {
+// here is a refusal to start: the metadata database is the single source of
+// truth and cannot be reconstructed from hash-named files.
+func Open(ctx context.Context, cfg Config) (*Store, error) {
 	s := &Store{cfg: cfg, dataDir: cfg.DataDir}
 
 	blobs := filepath.Join(s.dataDir, "blobs")
@@ -193,36 +177,40 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
-	db, err := openDB(filepath.Join(s.dataDir, "meta.db"), 5*time.Second)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("open meta.db: %w", err)
+		return nil, fmt.Errorf("parse database url: %w", err)
 	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("meta.db unreadable: %w", err)
+	// Bounds memory and the server's connection slots: without a cap, every
+	// writer waiting on a row lock holds a connection and the count tracks
+	// client concurrency with nothing stopping it. Reads share the pool, so a
+	// write storm can make a GET wait for a free connection — raise this if
+	// read latency matters more than the ceiling.
+	poolCfg.MaxConns = maxConns
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("open metadata database: %w", err)
 	}
-	if _, err := db.Exec(schemaSQL); err != nil {
-		db.Close()
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("metadata database unreachable: %w", err)
+	}
+	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	// Writers serialize anyway, so a small pool costs no write throughput and
-	// bounds memory: without a cap, every writer blocked on busy_timeout
-	// holds a connection and the count tracks concurrency with nothing
-	// stopping it. Reads share the pool, so a write storm can make a GET wait
-	// for a free connection — raise this if read latency matters more than
-	// the memory ceiling.
-	db.SetMaxOpenConns(maxOpenConns)
 
-	s.db = db
+	s.pool = pool
 	return s, nil
 }
 
-const maxOpenConns = 10
+const maxConns = 10
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() { s.pool.Close() }
 
-// DB exposes the handle for the health check and for tests.
-func (s *Store) DB() *sql.DB { return s.db }
+// Pool exposes the handle for the health check and for tests.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 // checkSameDevice fails fast when the data directories straddle filesystems.
 // os.Rename returns EXDEV across devices, so every PUT (tmp→blobs) or every
@@ -337,22 +325,22 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 		return PutResult{}, err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return PutResult{}, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	// This single read does double duty: it is the authoritative precondition
 	// check, and it decides 201-vs-200. Outside the transaction another PUT
 	// lands between the read and the write and the lost update is back with a
 	// smaller window.
 	var current string
-	err = tx.QueryRowContext(ctx,
-		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+	err = tx.QueryRow(ctx,
+		`SELECT hash FROM objects WHERE bucket = $1 AND object_id = $2`,
 		bucket, objectID).Scan(&current)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, pgx.ErrNoRows):
 		res.Created = true
 	case err != nil:
 		return PutResult{}, err
@@ -364,8 +352,8 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	// DO UPDATE rather than DO NOTHING: DO NOTHING takes no lock on the
 	// existing row, and that lock is what blocks the sweeper from deleting
 	// this blob between our stat and our commit.
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO blobs (bucket, hash) VALUES (?, ?)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO blobs (bucket, hash) VALUES ($1, $2)
 		 ON CONFLICT (bucket, hash) DO UPDATE SET hash = excluded.hash`,
 		bucket, hash); err != nil {
 		return PutResult{}, err
@@ -387,8 +375,8 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 		return PutResult{}, fmt.Errorf("stat blob: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO objects (bucket, object_id, hash) VALUES (?, ?, ?)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO objects (bucket, object_id, hash) VALUES ($1, $2, $3)
 		 ON CONFLICT (bucket, object_id) DO UPDATE SET hash = excluded.hash`,
 		bucket, objectID, hash); err != nil {
 		return PutResult{}, err
@@ -397,7 +385,7 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	if s.hookBeforeCommit != nil {
 		s.hookBeforeCommit()
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return PutResult{}, err
 	}
 	return res, nil
@@ -418,17 +406,17 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 		return err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	var hash string
-	err = tx.QueryRowContext(ctx,
-		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+	err = tx.QueryRow(ctx,
+		`SELECT hash FROM objects WHERE bucket = $1 AND object_id = $2`,
 		bucket, objectID).Scan(&hash)
-	exists := !errors.Is(err, sql.ErrNoRows)
+	exists := !errors.Is(err, pgx.ErrNoRows)
 	if err != nil && exists {
 		return err
 	}
@@ -441,12 +429,12 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 		return ErrNotFound
 	}
 
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM objects WHERE bucket = ? AND object_id = ?`,
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM objects WHERE bucket = $1 AND object_id = $2`,
 		bucket, objectID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return tx.Commit(ctx)
 }
 
 // Head returns the current content hash of an object.
@@ -462,10 +450,10 @@ func (s *Store) Head(ctx context.Context, bucket, objectID string) (string, erro
 
 func (s *Store) lookup(ctx context.Context, bucket, objectID string) (string, error) {
 	var hash string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT hash FROM objects WHERE bucket = ? AND object_id = ?`,
+	err := s.pool.QueryRow(ctx,
+		`SELECT hash FROM objects WHERE bucket = $1 AND object_id = $2`,
 		bucket, objectID).Scan(&hash)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	return hash, err

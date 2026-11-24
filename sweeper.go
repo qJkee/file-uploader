@@ -11,7 +11,12 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// sqlstateForeignKeyViolation is Postgres' foreign_key_violation class.
+const sqlstateForeignKeyViolation = "23503"
 
 // sweepLimit is how many reclaim candidates one query returns. A var so tests
 // can exercise the drain loop without creating a thousand blobs.
@@ -130,12 +135,12 @@ func (s *Store) reclaim(ctx context.Context, res *SweepResult) error {
 // reclaimCandidates is an indexed anti-join over a small table, not a
 // filesystem walk. A blob is live iff some objects row references it.
 func (s *Store) reclaimCandidates(ctx context.Context) ([]candidate, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT bucket, hash FROM blobs b
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM objects o WHERE o.bucket = b.bucket AND o.hash = b.hash
 		)
-		LIMIT ?`, sweepLimit)
+		LIMIT $1`, sweepLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -156,31 +161,39 @@ func (s *Store) reclaimCandidates(ctx context.Context) ([]candidate, error) {
 // re-check is what makes the move safe: a PUT that adopted this hash between
 // the candidate query and now leaves the DELETE matching no rows.
 func (s *Store) reclaimOne(ctx context.Context, c candidate) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
-	result, err := tx.ExecContext(ctx, `
-		DELETE FROM blobs WHERE bucket = ? AND hash = ?
-		  AND NOT EXISTS (SELECT 1 FROM objects WHERE bucket = ? AND hash = ?)`,
-		c.bucket, c.hash, c.bucket, c.hash)
+	result, err := tx.Exec(ctx, `
+		DELETE FROM blobs WHERE bucket = $1 AND hash = $2
+		  AND NOT EXISTS (SELECT 1 FROM objects WHERE bucket = $1 AND hash = $2)`,
+		c.bucket, c.hash)
 	if err != nil {
+		// Under READ COMMITTED the NOT EXISTS subquery reads a snapshot taken
+		// when the statement began, so a PUT that commits an objects row after
+		// that snapshot still lets the DELETE through — and the foreign key
+		// trigger, which runs against current data, rejects it. That is the
+		// same outcome as zero rows affected: the blob was adopted by a
+		// concurrent PUT, so leave it alone. The violation has already aborted
+		// the transaction, so return here and let the deferred Rollback run
+		// rather than falling through to Commit.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == sqlstateForeignKeyViolation {
+			return false, nil
+		}
 		return false, err
 	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if n == 0 {
+	if result.RowsAffected() == 0 {
 		return false, nil // adopted by a concurrent PUT; leave it alone
 	}
 
 	if err := s.stageOrRemove(c); err != nil {
 		return false, err // rollback keeps the row, so the next sweep retries
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -315,12 +328,12 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 
 	blobsRoot := filepath.Join(s.dataDir, "blobs")
 
-	// The guard. Without it a lost or replaced meta.db — wrong volume
-	// mounted, bad restore, someone clearing the directory — means the
-	// service starts on an empty schema and deletes every object on disk,
-	// silently and permanently.
+	// The guard. Without it a lost or replaced metadata database — wrong
+	// server, bad restore, someone clearing the schema — means the service
+	// starts on an empty schema and deletes every object on disk, silently
+	// and permanently.
 	var hasRows bool
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM blobs)`).Scan(&hasRows); err != nil {
 		return 0, err
 	}
@@ -332,7 +345,7 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 		if !empty {
 			slog.Error("blobs table is empty but the blob tree is not; skipping the orphan walk",
 				"blobs_dir", blobsRoot,
-				"hint", "check that the expected meta.db is mounted before restarting")
+				"hint", "check that -database-url points at the expected database before restarting")
 		}
 		return 0, nil
 	}
@@ -422,15 +435,9 @@ func (s *Store) knownHashes(ctx context.Context, bucket string, hashes []string)
 	if len(hashes) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(hashes)+1)
-	args = append(args, bucket)
-	for _, h := range hashes {
-		args = append(args, h)
-	}
-	query := `SELECT hash FROM blobs WHERE bucket = ? AND hash IN (?` +
-		strings.Repeat(",?", len(hashes)-1) + `)`
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.pool.Query(ctx,
+		`SELECT hash FROM blobs WHERE bucket = $1 AND hash = ANY($2)`,
+		bucket, hashes)
 	if err != nil {
 		return nil, err
 	}
@@ -455,15 +462,15 @@ func (s *Store) knownHashes(ctx context.Context, bucket string, hashes []string)
 // pointing at a file now sitting in trash: a permanent 500 on every read,
 // and the one alert the whole locking design exists to keep at zero.
 func (s *Store) reclaimOrphan(ctx context.Context, bucket, hash, path string) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE, see openDB
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	var known bool
-	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = ? AND hash = ?)`,
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = $1 AND hash = $2)`,
 		bucket, hash).Scan(&known); err != nil {
 		return false, err
 	}
@@ -475,7 +482,7 @@ func (s *Store) reclaimOrphan(ctx context.Context, bucket, hash, path string) (b
 	if err != nil || !moved {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -65,12 +65,10 @@ func TestHealthz(t *testing.T) {
 
 func TestHealthzFailsOnAClosedStore(t *testing.T) {
 	ts := newTestServer(t)
-	if err := ts.store.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	ts.store.Close()
 
 	if got := ts.do(t, http.MethodGet, "/healthz", nil, nil).StatusCode; got != http.StatusServiceUnavailable {
-		t.Errorf("GET /healthz on a closed store = %d, want 503", got)
+		t.Errorf("GET /healthz on a closed pool = %d, want 503", got)
 	}
 }
 

@@ -404,7 +404,7 @@ func TestFailedPreconditionLeavesNoTrace(t *testing.T) {
 		t.Errorf("temp files = %d, want 0", n)
 	}
 	var blobs int
-	if err := ts.store.DB().QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobs); err != nil {
+	if err := ts.store.Pool().QueryRow(t.Context(), `SELECT count(*) FROM blobs`).Scan(&blobs); err != nil {
 		t.Fatal(err)
 	}
 	if blobs != 1 {

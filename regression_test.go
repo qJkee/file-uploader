@@ -328,8 +328,8 @@ func TestSweepMetricsSurviveAPartialFailure(t *testing.T) {
 // capping memory.
 func TestConnectionPoolIsBounded(t *testing.T) {
 	s := newTestStore(t)
-	if got := s.DB().Stats().MaxOpenConnections; got != maxOpenConns {
-		t.Errorf("MaxOpenConnections = %d, want %d", got, maxOpenConns)
+	if got := s.Pool().Stat().MaxConns(); got != maxConns {
+		t.Errorf("MaxConns = %d, want %d", got, maxConns)
 	}
 }
 
