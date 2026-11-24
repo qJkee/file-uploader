@@ -480,29 +480,51 @@ func TestRepeatedIfMatchHeaderLines(t *testing.T) {
 	}
 }
 
-// concurrentPuts fires 16 PUTs of distinct bodies at one path, all carrying
-// the same precondition, and returns each writer's status beside the body it
-// sent. 16 rather than TestLostUpdatePrevented's 2 because two writers under
+func allPut(int) string { return http.MethodPut }
+
+// putOrDelete makes the even writers update and the odd ones delete.
+func putOrDelete(i int) string {
+	if i%2 == 0 {
+		return http.MethodPut
+	}
+	return http.MethodDelete
+}
+
+// concurrentWrites fires 16 writes at one path, all carrying the same
+// precondition, and returns each writer's status beside the body it sent —
+// empty for the DELETE writers, which send none. method picks writer i's
+// verb. 16 rather than TestLostUpdatePrevented's 2 because two writers under
 // READ COMMITTED serialise by accident often enough to hide a missing lock.
-func concurrentPuts(t *testing.T, ts *testServer, path string, header http.Header) (statuses []int, bodies []string) {
+func concurrentWrites(t *testing.T, ts *testServer, path string, header http.Header, method func(i int) string) (statuses []int, bodies []string) {
 	t.Helper()
 	const n = 16
 	statuses, bodies = make([]int, n), make([]string, n)
 	start := make(chan struct{})
 	var warm, wg sync.WaitGroup
 	for i := range n {
-		bodies[i] = fmt.Sprintf("writer-%02d", i)
 		warm.Add(1)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// A HEAD first, so this goroutine's TCP connection and a pooled
-			// Postgres connection both already exist. Setting those up on the
-			// PUT itself scatters the writers' arrivals far wider than the
-			// window under test, which hides the bug about half the time.
-			ts.do(t, http.MethodHead, path, nil, nil)
-			warm.Done()
+			// A HEAD first: it goes through the same pgxpool as the write, so
+			// by the time the barrier opens the pool's connections are
+			// already open. Opening one costs far more than the window under
+			// test, so without this the writers arrive too scattered to
+			// overlap and the bug hides about half the time. (The HTTP
+			// connections do not survive: httptest's client caps idle
+			// connections per host at 2.) Deferred, because ts.do calls
+			// t.Fatalf on a transport error and a missed warm.Done would hang
+			// the package rather than fail it.
+			func() {
+				defer warm.Done()
+				ts.do(t, http.MethodHead, path, nil, nil)
+			}()
 			<-start // release them together, so the windows actually overlap
+			if method(i) == http.MethodDelete {
+				statuses[i] = ts.do(t, http.MethodDelete, path, nil, header).StatusCode
+				return
+			}
+			bodies[i] = fmt.Sprintf("writer-%02d", i)
 			statuses[i] = ts.do(t, http.MethodPut, path, strings.NewReader(bodies[i]), header).StatusCode
 		}()
 	}
@@ -519,7 +541,7 @@ func TestConcurrentIfMatchPicksOneWinner(t *testing.T) {
 	ts := newTestServer(t)
 	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
 
-	statuses, bodies := concurrentPuts(t, ts, "/objects/b1/a", hdr("If-Match", etag))
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-Match", etag), allPut)
 
 	winner, wins, conflicts := "", 0, 0
 	for i, st := range statuses {
@@ -547,7 +569,7 @@ func TestConcurrentIfMatchPicksOneWinner(t *testing.T) {
 func TestConcurrentCreateOnlyPicksOneWinner(t *testing.T) {
 	ts := newTestServer(t)
 
-	statuses, bodies := concurrentPuts(t, ts, "/objects/b1/a", hdr("If-None-Match", "*"))
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-None-Match", "*"), allPut)
 
 	winner, created, conflicts := "", 0, 0
 	for i, st := range statuses {
@@ -566,5 +588,46 @@ func TestConcurrentCreateOnlyPicksOneWinner(t *testing.T) {
 	}
 	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
 		t.Errorf("stored body = %q, want the creator's %q", got, winner)
+	}
+}
+
+// TestConcurrentIfMatchDeleteAndPutPicksOneWinner: Delete takes the same
+// per-key lock as Put and needs it for the same reason, but neither test
+// above issues a DELETE, so dropping that call would go unnoticed. Sixteen
+// clients hold one ETag, half updating and half deleting: without the lock a
+// DELETE reads h1, passes its precondition, and then removes a row a
+// concurrent PUT has already moved to h2 — a lost update with nothing left
+// behind, and two clients both told they succeeded.
+func TestConcurrentIfMatchDeleteAndPutPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
+
+	statuses, bodies := concurrentWrites(t, ts, "/objects/b1/a", hdr("If-Match", etag), putOrDelete)
+
+	winner, wins, conflicts := -1, 0, 0
+	for i, st := range statuses {
+		switch {
+		case st >= 200 && st < 300:
+			wins++
+			winner = i
+		case st == http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d (%s): status %d, want 2xx or 412", i, putOrDelete(i), st)
+		}
+	}
+	if want := len(statuses) - 1; wins != 1 || conflicts != want {
+		t.Fatalf("got %d winners and %d conflicts, want 1 and %d — writers holding one ETag both wrote", wins, conflicts, want)
+	}
+
+	resp := ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)
+	if putOrDelete(winner) == http.MethodDelete {
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("writer %d deleted the object, but GET = %d, want 404", winner, resp.StatusCode)
+		}
+		return
+	}
+	if got := readBody(t, resp); got != bodies[winner] {
+		t.Errorf("stored body = %q, want the winner's %q", got, bodies[winner])
 	}
 }
