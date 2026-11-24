@@ -164,6 +164,10 @@ func mkdirAllSync(path string, perm os.FileMode) error {
 // here is a refusal to start: the metadata database is the single source of
 // truth and cannot be reconstructed from hash-named files.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
+	if cfg.DatabaseURL == "" {
+		return nil, errors.New("database URL is required")
+	}
+
 	s := &Store{cfg: cfg, dataDir: cfg.DataDir}
 
 	blobs := filepath.Join(s.dataDir, "blobs")
@@ -213,6 +217,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("metadata database unreachable: %w", err)
 	}
+	// Concurrent CREATE TABLE IF NOT EXISTS from multiple replicas doing a
+	// simultaneous cold start can raise a unique violation on pg_catalog. This
+	// service is designed for single-instance deployment (blobs on local disk),
+	// so the race is a non-issue in production.
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("create schema: %w", err)

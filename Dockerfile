@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-# Pure-Go SQLite means no cgo, which is what makes a scratch image possible.
+# Pure-Go pgx means no cgo, which is what makes a scratch image possible.
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /objectstore .
 
 # Staged here because scratch has no shell to mkdir with, and / is root-owned
