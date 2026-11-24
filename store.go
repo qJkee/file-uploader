@@ -188,6 +188,19 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	// read latency matters more than the ceiling.
 	poolCfg.MaxConns = maxConns
 
+	// Set per-connection timeouts. lock_timeout restores parity with SQLite's
+	// busy_timeout(5s): a writer blocked on the advisory lock gets 55P03
+	// (lock_not_available) and can retry. statement_timeout is insurance
+	// against runaway queries; every statement in this service is short, as
+	// file streaming does not touch the database.
+	if poolCfg.ConnConfig.RuntimeParams == nil {
+		poolCfg.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	poolCfg.ConnConfig.RuntimeParams["lock_timeout"] = "5s"
+	poolCfg.ConnConfig.RuntimeParams["statement_timeout"] = "30s"
+	// Timeout for establishing new connections to the database server.
+	poolCfg.ConnConfig.ConnectTimeout = 5 * time.Second
+
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("open metadata database: %w", err)
@@ -358,7 +371,7 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	if err != nil {
 		return PutResult{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	if err := lockObjectKey(ctx, tx, bucket, objectID); err != nil {
 		return PutResult{}, err
@@ -444,7 +457,7 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	if err := lockObjectKey(ctx, tx, bucket, objectID); err != nil {
 		return err

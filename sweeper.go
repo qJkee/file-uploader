@@ -165,7 +165,7 @@ func (s *Store) reclaimOne(ctx context.Context, c candidate) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	result, err := tx.Exec(ctx, `
 		DELETE FROM blobs WHERE bucket = $1 AND hash = $2
@@ -466,7 +466,7 @@ func (s *Store) reclaimOrphan(ctx context.Context, bucket, hash, path string) (b
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	var known bool
 	if err := tx.QueryRow(ctx,
