@@ -479,3 +479,92 @@ func TestRepeatedIfMatchHeaderLines(t *testing.T) {
 		t.Errorf("status = %d, want 200 — either tag matching is enough", resp.StatusCode)
 	}
 }
+
+// concurrentPuts fires 16 PUTs of distinct bodies at one path, all carrying
+// the same precondition, and returns each writer's status beside the body it
+// sent. 16 rather than TestLostUpdatePrevented's 2 because two writers under
+// READ COMMITTED serialise by accident often enough to hide a missing lock.
+func concurrentPuts(t *testing.T, ts *testServer, path string, header http.Header) (statuses []int, bodies []string) {
+	t.Helper()
+	const n = 16
+	statuses, bodies = make([]int, n), make([]string, n)
+	start := make(chan struct{})
+	var warm, wg sync.WaitGroup
+	for i := range n {
+		bodies[i] = fmt.Sprintf("writer-%02d", i)
+		warm.Add(1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A HEAD first, so this goroutine's TCP connection and a pooled
+			// Postgres connection both already exist. Setting those up on the
+			// PUT itself scatters the writers' arrivals far wider than the
+			// window under test, which hides the bug about half the time.
+			ts.do(t, http.MethodHead, path, nil, nil)
+			warm.Done()
+			<-start // release them together, so the windows actually overlap
+			statuses[i] = ts.do(t, http.MethodPut, path, strings.NewReader(bodies[i]), header).StatusCode
+		}()
+	}
+	warm.Wait()
+	close(start)
+	wg.Wait()
+	return statuses, bodies
+}
+
+// TestConcurrentIfMatchPicksOneWinner: every writer read the same ETag, so
+// exactly one may win. Without the per-key lock the precondition read and the
+// write sit in different snapshots and several writers pass the check.
+func TestConcurrentIfMatchPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+	etag := ts.put(t, "/objects/b1/a", "base").Header.Get("ETag")
+
+	statuses, bodies := concurrentPuts(t, ts, "/objects/b1/a", hdr("If-Match", etag))
+
+	winner, wins, conflicts := "", 0, 0
+	for i, st := range statuses {
+		switch {
+		case st >= 200 && st < 300:
+			wins++
+			winner = bodies[i]
+		case st == http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d: status %d, want 2xx or 412", i, st)
+		}
+	}
+	if want := len(statuses) - 1; wins != 1 || conflicts != want {
+		t.Fatalf("got %d winners and %d conflicts, want 1 and %d — a second winner is a lost update", wins, conflicts, want)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
+		t.Errorf("stored body = %q, want the winner's %q", got, winner)
+	}
+}
+
+// TestConcurrentCreateOnlyPicksOneWinner: If-None-Match: * is create-only, so
+// of 16 writers racing for one absent path exactly one may create it. This is
+// the case SELECT ... FOR UPDATE cannot cover — there is no row to lock.
+func TestConcurrentCreateOnlyPicksOneWinner(t *testing.T) {
+	ts := newTestServer(t)
+
+	statuses, bodies := concurrentPuts(t, ts, "/objects/b1/a", hdr("If-None-Match", "*"))
+
+	winner, created, conflicts := "", 0, 0
+	for i, st := range statuses {
+		switch st {
+		case http.StatusCreated:
+			created++
+			winner = bodies[i]
+		case http.StatusPreconditionFailed:
+			conflicts++
+		default:
+			t.Errorf("writer %d: status %d, want 201 or 412", i, st)
+		}
+	}
+	if want := len(statuses) - 1; created != 1 || conflicts != want {
+		t.Fatalf("got %d creations and %d conflicts, want 1 and %d — create-only let a second writer through", created, conflicts, want)
+	}
+	if got := readBody(t, ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil)); got != winner {
+		t.Errorf("stored body = %q, want the creator's %q", got, winner)
+	}
+}

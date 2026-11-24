@@ -273,6 +273,35 @@ var (
 	ErrBlobMissing = errors.New("blob missing")
 )
 
+// lockObjectKey serialises writers on one object key for the rest of tx. It
+// must be the first statement of every write transaction, before the
+// precondition read.
+//
+// This is what `_txlock=immediate` used to give for free: under SQLite every
+// write transaction was globally mutually exclusive, which kept Put's
+// precondition read and its write in one snapshot. Postgres under READ
+// COMMITTED gives them different snapshots, so without this two If-Match
+// writers both read hash h, both pass, and one update is silently lost; and
+// two `If-None-Match: *` writers both see no row, both pass, and ON CONFLICT
+// DO UPDATE lets the second overwrite the first.
+//
+// SELECT ... FOR UPDATE cannot replace it: a create-only PUT has no row to
+// lock. The lock is held by the transaction and released by commit or
+// rollback, so no code path can leak it.
+//
+// Two integers rather than one hash of a concatenation, so "a"+"bc" and
+// "ab"+"c" do not share a lock; a collision only costs extra blocking. The
+// lock is per database, not per schema — it can only over-serialise, never
+// under-serialise.
+func lockObjectKey(ctx context.Context, tx pgx.Tx, bucket, objectID string) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+		bucket, objectID); err != nil {
+		return fmt.Errorf("lock %s/%s: %w", bucket, objectID, err)
+	}
+	return nil
+}
+
 // PutResult describes what a Put did. Created drives 201-vs-200; Dedup says
 // the bytes were already on disk under this bucket.
 type PutResult struct {
@@ -331,10 +360,15 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 	}
 	defer tx.Rollback(ctx)
 
+	if err := lockObjectKey(ctx, tx, bucket, objectID); err != nil {
+		return PutResult{}, err
+	}
+
 	// This single read does double duty: it is the authoritative precondition
-	// check, and it decides 201-vs-200. Outside the transaction another PUT
-	// lands between the read and the write and the lost update is back with a
-	// smaller window.
+	// check, and it decides 201-vs-200. Outside the transaction — or inside it
+	// without the lock above, since READ COMMITTED gives each statement its
+	// own snapshot — another PUT lands between the read and the write and the
+	// lost update is back with a smaller window.
 	var current string
 	err = tx.QueryRow(ctx,
 		`SELECT hash FROM objects WHERE bucket = $1 AND object_id = $2`,
@@ -411,6 +445,10 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre Precond
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	if err := lockObjectKey(ctx, tx, bucket, objectID); err != nil {
+		return err
+	}
 
 	var hash string
 	err = tx.QueryRow(ctx,

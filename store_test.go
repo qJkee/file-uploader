@@ -133,6 +133,14 @@ func TestSearchPathAppliesToEveryPooledConnection(t *testing.T) {
 	}
 	wg.Wait()
 
+	// Without this the test can pass vacuously: the pool only opens a
+	// connection when Acquire finds no idle one, so 16 goroutines that happen
+	// to serialise all run on the same connection and prove nothing about the
+	// risk this test exists to rule out.
+	if n := s.Pool().Stat().NewConnsCount(); n < 2 {
+		t.Errorf("the pool opened %d connection(s); this test only means something across several", n)
+	}
+
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("goroutine %d: %v", i, err)
