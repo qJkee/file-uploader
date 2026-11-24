@@ -1,5 +1,11 @@
 # HTTP object store with per-bucket dedup
 
+> **Superseded on the storage engine.** This document is the original SQLite
+> design and still says `meta.db`, `_pragma`, `_txlock=immediate` and "SQLite
+> has no row locks"; metadata now lives in Postgres via pgx/v5. For anything
+> touching the database, locking or deployment, the authority is
+> `docs/superpowers/specs/2026-11-24-postgres-migration-design.md`.
+
 ## Context
 
 Empty repo (`/Users/bulatzamalutdinov/work/test-task`). An HTTP service storing

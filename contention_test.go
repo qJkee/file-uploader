@@ -376,6 +376,10 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	before := backlogRows(t, s)
 	statDrain := s.Pool().Stat()
 	watching := make(chan struct{})
+	// The watcher runs only here, so the drain phase carries one extra
+	// pg_locks query every 20ms that the baseline did not — the one respect
+	// in which the two phases are not identical work. The bias runs against
+	// the drain, so it can only understate the throughput ratio below.
 	lockQueue := watchBlobsLockQueue(t, s, watching)
 	drain := runPhase(t, ts, client, "drain", contentionWindow)
 	close(watching)
