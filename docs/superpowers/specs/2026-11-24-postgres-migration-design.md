@@ -171,3 +171,47 @@ plain FK-liveness check, since Postgres cannot turn foreign keys off.
 - Whether schema creation runs on every boot (as today) or once; today's
   `CREATE TABLE IF NOT EXISTS` on startup is fine to keep.
 - A `compose.yaml` for local development, if it helps.
+
+## Outcome
+
+Measured by `TestSweepDoesNotStarveWriters` (`contention_test.go`): 8 workers
+PUTting to distinct keys plus 4 concurrent readers, for 6 s against one
+`httptest.Server`, with and without a concurrent `Sweep` draining a backlog
+of 60,000 unreferenced blobs. SQLite's row is the original audit.
+
+| | PUTs | PUT p50 | PUT p95 | PUT p99 | PUT max |
+|---|---|---|---|---|---|
+| SQLite, baseline | 1837 | 23 ms | 43 ms | 117 ms | 571 ms |
+| SQLite, during drain | **99** | 189 ms | 2.25 s | 3.37 s | 3.44 s |
+| Postgres, baseline | 783 | 61 ms | 84 ms | 94 ms | 110 ms |
+| Postgres, during drain | **776** | 62 ms | 82 ms | 90 ms | 106 ms |
+
+Reads were not measured in the original audit; they are here because a writer
+blocked in the database holds one of the pool's 10 connections.
+
+| | GETs | GET p50 | GET p95 | GET p99 | GET max |
+|---|---|---|---|---|---|
+| Postgres, baseline | 13821 | 0.8 ms | 8.1 ms | 23 ms | 47 ms |
+| Postgres, during drain | 14802 | 0.8 ms | 5.6 ms | 21 ms | 49 ms |
+
+**The goal was met.** Throughput during the drain is 99% of baseline where
+SQLite kept 5%, and p99 is unchanged where SQLite's rose 29×. No request
+failed in either phase. The drain reclaimed 308 blobs during the window, so
+the sweeper really was working. Across eight runs — plain, under `-race`, and
+under eight CPU hogs — the ratio stayed between 0.95 and 1.14.
+
+Three caveats, in `.superpowers/sdd/2026-11-24-postgres-migration/task-6-report.md`
+in full:
+
+1. **Absolute numbers are not comparable across the two rows.** Postgres here
+   runs in a Docker VM and the measurement is dominated by macOS
+   `F_FULLFSYNC`, not by the database. Only the baseline→drain ratio carries.
+2. **The sweeper, not the request path, is now the thing that gets starved.**
+   Reclaim runs at ~1300/s idle but ~50/s under this load, and clients orphan
+   blobs at ~130/s, so garbage outruns reclamation under sustained overwrite
+   traffic. Disk leaks; nothing breaks. Not addressed here.
+3. **The headline assertions are blunt.** Re-adding a global write lock to
+   `reclaimOne` leaves throughput at 96% of baseline, because a sweeper
+   throttled to 50 reclaims/s cannot starve anyone. The test catches that
+   regression through two other assertions — reclaims completed during the
+   window, and cumulative pool-acquire wait.
