@@ -26,4 +26,6 @@ USER 65532:65532
 # device check catches that at boot rather than per request.
 VOLUME /data
 EXPOSE 8080
-ENTRYPOINT ["/objectstore", "-data", "/data", "-addr", ":8080"]
+ENV OBJECTSTORE_DATA=/data \
+    OBJECTSTORE_ADDR=:8080
+ENTRYPOINT ["/objectstore"]

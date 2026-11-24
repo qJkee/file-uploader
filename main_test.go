@@ -78,6 +78,18 @@ func TestEnvFallback(t *testing.T) {
 	})
 }
 
+func TestRequiredFlags(t *testing.T) {
+	t.Run("run with no args and no env reports missing -data", func(t *testing.T) {
+		err := run([]string{})
+		if err == nil {
+			t.Fatal("run with no args succeeded; want an error")
+		}
+		if !strings.Contains(err.Error(), "-data") {
+			t.Errorf("error = %q, want it to name -data", err)
+		}
+	})
+}
+
 func TestDatabaseURLIsRequired(t *testing.T) {
 	t.Run("run rejects empty database URL", func(t *testing.T) {
 		dir := t.TempDir()
