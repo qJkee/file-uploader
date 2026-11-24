@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -80,36 +82,38 @@ func TestEnvFallback(t *testing.T) {
 
 func TestRequiredFlags(t *testing.T) {
 	t.Run("run with no args and no env reports missing -data", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATA", "")
+		os.Unsetenv("OBJECTSTORE_DATA")
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
 		err := run([]string{})
-		if err == nil {
-			t.Fatal("run with no args succeeded; want an error")
-		}
-		if !strings.Contains(err.Error(), "-data") {
-			t.Errorf("error = %q, want it to name -data", err)
+		if !errors.Is(err, errDataRequired) {
+			t.Errorf("error = %v, want errDataRequired", err)
 		}
 	})
 }
 
 func TestDatabaseURLIsRequired(t *testing.T) {
 	t.Run("run rejects empty database URL", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
 		dir := t.TempDir()
 		err := run([]string{"-data", dir})
-		if err == nil {
-			t.Fatal("run with no -database-url succeeded; want an error")
-		}
-		if !strings.Contains(err.Error(), "-database-url") {
-			t.Errorf("error = %q, want it to name -database-url", err)
+		if !errors.Is(err, errDatabaseURLRequired) {
+			t.Errorf("error = %v, want errDatabaseURLRequired", err)
 		}
 	})
 
 	t.Run("run rejects whitespace-only database URL", func(t *testing.T) {
+		t.Setenv("OBJECTSTORE_DATABASE_URL", "")
+		os.Unsetenv("OBJECTSTORE_DATABASE_URL")
+
 		dir := t.TempDir()
 		err := run([]string{"-data", dir, "-database-url", "  \t\n  "})
-		if err == nil {
-			t.Fatal("run with whitespace-only -database-url succeeded; want an error")
-		}
-		if !strings.Contains(err.Error(), "-database-url") {
-			t.Errorf("error = %q, want it to name -database-url", err)
+		if !errors.Is(err, errDatabaseURLRequired) {
+			t.Errorf("error = %v, want errDatabaseURLRequired", err)
 		}
 	})
 

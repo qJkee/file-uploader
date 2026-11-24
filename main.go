@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+var (
+	errDataRequired        = errors.New("-data is required")
+	errDatabaseURLRequired = errors.New("-database-url is required")
+)
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		slog.Error("fatal", "err", err)
@@ -39,10 +44,10 @@ func run(args []string) error {
 		return err
 	}
 	if *data == "" {
-		return errors.New("-data is required")
+		return errDataRequired
 	}
 	if strings.TrimSpace(*databaseURL) == "" {
-		return errors.New("-database-url is required")
+		return errDatabaseURLRequired
 	}
 
 	// Captured before the server accepts anything, so the orphan walk can
