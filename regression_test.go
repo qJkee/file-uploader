@@ -321,6 +321,150 @@ func TestSweepMetricsSurviveAPartialFailure(t *testing.T) {
 	}
 }
 
+// --- audit follow-ups ---
+
+// TestConnectionPoolIsBounded: every blocked writer holds a connection, so
+// an unbounded pool lets connection count track concurrency with nothing
+// capping memory.
+func TestConnectionPoolIsBounded(t *testing.T) {
+	s := newTestStore(t)
+	if got := s.DB().Stats().MaxOpenConnections; got != maxOpenConns {
+		t.Errorf("MaxOpenConnections = %d, want %d", got, maxOpenConns)
+	}
+}
+
+// TestHealthzDoesNoDiskWrite: /healthz is unauthenticated and uncacheable by
+// clients, so doing filesystem work per call turns a trickle of traffic into
+// heavy disk load.
+func TestHealthzDoesNoDiskWrite(t *testing.T) {
+	ts := newTestServer(t)
+	for range 20 {
+		if got := ts.do(t, http.MethodGet, "/healthz", nil, nil).StatusCode; got != http.StatusOK {
+			t.Fatalf("GET /healthz = %d, want 200", got)
+		}
+	}
+	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
+		t.Errorf("temp files after 20 health checks = %d, want 0", n)
+	}
+}
+
+// TestOrphanWalkUsesBulkLookups: the walk must not cost one query per file.
+// Almost every file in a healthy store is known, so the per-known-file cost
+// is what dominates an hourly walk of a million blobs.
+func TestKnownHashesLooksUpABatch(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, "b1", "a", "one")
+	mustPut(t, s, "b1", "b", "two")
+	mustPut(t, s, "b2", "c", "three") // another bucket must not leak in
+
+	got, err := s.knownHashes(t.Context(), "b1", []string{
+		hashOf("one"), hashOf("two"), hashOf("three"), hashOf("absent"),
+	})
+	if err != nil {
+		t.Fatalf("knownHashes: %v", err)
+	}
+
+	for _, body := range []string{"one", "two"} {
+		if !got[hashOf(body)] {
+			t.Errorf("%q should be known in b1", body)
+		}
+	}
+	for _, body := range []string{"three", "absent"} {
+		if got[hashOf(body)] {
+			t.Errorf("%q should not be known in b1", body)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2", len(got))
+	}
+}
+
+// TestOrphanWalkBatchesAcrossTheBoundary runs more files than one batch
+// holds, so a bug in the flush-the-remainder path shows up.
+func TestOrphanWalkBatchesAcrossTheBoundary(t *testing.T) {
+	old := orphanBatchSize
+	orphanBatchSize = 4
+	t.Cleanup(func() { orphanBatchSize = old })
+
+	s := newTestStore(t)
+	const known = 11
+	for i := range known {
+		mustPut(t, s, "b1", fmt.Sprintf("o%d", i), fmt.Sprintf("body-%d", i))
+	}
+	orphan := writeOrphanBlob(t, s, "b1", "not referenced")
+
+	n, err := s.SweepOrphans(t.Context(), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+
+	if n != 1 {
+		t.Errorf("reclaimed = %d, want 1", n)
+	}
+	if _, statErr := os.Stat(orphan); !os.IsNotExist(statErr) {
+		t.Errorf("orphan survived: %v", statErr)
+	}
+	for i := range known {
+		if got := mustGet(t, s, "b1", fmt.Sprintf("o%d", i)); got != fmt.Sprintf("body-%d", i) {
+			t.Fatalf("known blob %d was reclaimed or damaged: %q", i, got)
+		}
+	}
+}
+
+// TestTrashSizeCapEvictsOldestFirst: retention alone cannot bound disk when
+// the same object is uploaded and deleted repeatedly — every cycle leaves
+// another copy in trash and none expire for a day.
+func TestTrashSizeCapEvictsOldestFirst(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.TrashRetention = time.Hour
+	s.cfg.MaxTrashBytes = 30 // bytes: small enough that 4x10 does not fit
+
+	// Four 10-byte objects, trashed oldest-first.
+	bodies := []string{"aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"}
+	for i, body := range bodies {
+		id := fmt.Sprintf("o%d", i)
+		mustPut(t, s, "b1", id, body)
+		if err := s.Delete(t.Context(), "b1", id, Precondition{}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		mustSweep(t, s)
+		stamp := time.Now().Add(time.Duration(i-len(bodies)) * time.Minute)
+		if err := os.Chtimes(s.trashPath("b1", hashOf(body)), stamp, stamp); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	res := mustSweep(t, s)
+
+	if res.TrashBytes > s.cfg.MaxTrashBytes {
+		t.Errorf("TrashBytes = %d, want <= %d", res.TrashBytes, s.cfg.MaxTrashBytes)
+	}
+	// The oldest must go first, the newest must survive.
+	if _, err := os.Stat(s.trashPath("b1", hashOf(bodies[0]))); !os.IsNotExist(err) {
+		t.Errorf("the oldest trash entry survived the size cap: %v", err)
+	}
+	if _, err := os.Stat(s.trashPath("b1", hashOf(bodies[3]))); err != nil {
+		t.Errorf("the newest trash entry was evicted: %v", err)
+	}
+}
+
+func TestTrashSizeCapDisabledAtZero(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.TrashRetention = time.Hour
+	s.cfg.MaxTrashBytes = 0
+
+	mustPut(t, s, "b1", "a", "some bytes here")
+	if err := s.Delete(t.Context(), "b1", "a", Precondition{}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	mustSweep(t, s)
+
+	res := mustSweep(t, s)
+	if res.TrashFiles != 1 {
+		t.Errorf("TrashFiles = %d, want 1 — a zero cap must disable the limit", res.TrashFiles)
+	}
+}
+
 // TestRepeatedIfMatchHeaderLines: RFC 9110 §5.3 makes two header lines
 // equivalent to one comma-separated list, so a legitimate write must not get
 // a spurious 412.

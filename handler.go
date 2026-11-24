@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -49,21 +48,19 @@ func instrument(method string, next http.Handler) http.Handler {
 			next))
 }
 
-// health reports ready when the metadata database answers and the data
-// directory is writable.
+// health reports ready when the metadata database answers.
+//
+// It deliberately does no filesystem work. The endpoint is unauthenticated
+// and callers cannot be made to back off, so a write probe per request turns
+// a trickle of traffic into heavy disk load for free. An unwritable data
+// directory still surfaces immediately: PUTs fail with 507 and the sweeper
+// errors, both of which are visible in /metrics.
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	var one int
 	if err := h.store.DB().QueryRowContext(r.Context(), `SELECT 1`).Scan(&one); err != nil {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	probe, err := os.CreateTemp(h.store.tmpDir(), "healthz-*")
-	if err != nil {
-		http.Error(w, "data directory not writable", http.StatusServiceUnavailable)
-		return
-	}
-	probe.Close()
-	os.Remove(probe.Name())
 	w.WriteHeader(http.StatusOK)
 }
 

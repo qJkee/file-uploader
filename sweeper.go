@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -25,6 +26,7 @@ type SweepResult struct {
 	Orphans      int
 	Failed       int
 	TrashDeleted int
+	TrashEvicted int
 	TmpDeleted   int
 	TrashFiles   int
 	TrashBytes   int64
@@ -231,7 +233,9 @@ func (s *Store) moveToTrash(bucket, hash, src string) (bool, error) {
 // what survives, so trash_files and trash_bytes cost nothing at scrape time.
 func (s *Store) expireTrash(ctx context.Context, res *SweepResult) error {
 	cutoff := time.Now().Add(-s.cfg.TrashRetention)
-	return walkFiles(ctx, filepath.Join(s.dataDir, "trash"), func(path string, info fs.FileInfo) error {
+	var kept []trashEntry
+
+	err := walkFiles(ctx, filepath.Join(s.dataDir, "trash"), func(path string, info fs.FileInfo) error {
 		if info.ModTime().Before(cutoff) {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return err
@@ -239,10 +243,43 @@ func (s *Store) expireTrash(ctx context.Context, res *SweepResult) error {
 			res.TrashDeleted++
 			return nil
 		}
-		res.TrashFiles++
+		kept = append(kept, trashEntry{path: path, mtime: info.ModTime(), size: info.Size()})
 		res.TrashBytes += info.Size()
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Retention alone cannot bound disk: uploading and deleting the same
+	// object in a loop leaves a copy per cycle and none expire for a day.
+	// Past the cap, evict oldest first — the entries closest to expiring
+	// anyway, and the least likely to be the one an operator wants back.
+	if s.cfg.MaxTrashBytes > 0 && res.TrashBytes > s.cfg.MaxTrashBytes {
+		slices.SortFunc(kept, func(a, b trashEntry) int { return a.mtime.Compare(b.mtime) })
+		evicted := 0
+		for _, e := range kept {
+			if res.TrashBytes <= s.cfg.MaxTrashBytes {
+				break
+			}
+			if err := os.Remove(e.path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			res.TrashBytes -= e.size
+			res.TrashDeleted++
+			res.TrashEvicted++
+			evicted++
+		}
+		kept = kept[evicted:]
+	}
+	res.TrashFiles = len(kept)
+	return nil
+}
+
+type trashEntry struct {
+	path  string
+	mtime time.Time
+	size  int64
 }
 
 // cleanTmp removes aborted uploads whose process died before the deferred
@@ -301,6 +338,14 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 	}
 
 	reclaimed := 0
+	batch := make([]blobFile, 0, orphanBatchSize)
+	flush := func() error {
+		n, err := s.reclaimOrphanBatch(ctx, batch)
+		reclaimed += n
+		batch = batch[:0]
+		return err
+	}
+
 	err := walkFiles(ctx, blobsRoot, func(path string, info fs.FileInfo) error {
 		if !info.ModTime().Before(startedAt) {
 			return nil
@@ -309,29 +354,97 @@ func (s *Store) SweepOrphans(ctx context.Context, startedAt time.Time) (int, err
 		if !ok {
 			return nil // not something this service wrote; leave it
 		}
-		var known bool
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM blobs WHERE bucket = ? AND hash = ?)`,
-			bucket, hash).Scan(&known); err != nil {
-			return err
-		}
-		if known {
+		batch = append(batch, blobFile{bucket: bucket, hash: hash, path: path})
+		if len(batch) < orphanBatchSize {
 			return nil
+		}
+		return flush()
+	})
+	if err != nil {
+		return reclaimed, err
+	}
+	if len(batch) > 0 {
+		if err := flush(); err != nil {
+			return reclaimed, err
+		}
+	}
+	return reclaimed, nil
+}
+
+// orphanBatchSize is how many files are checked per query. Almost every file
+// in a healthy store is known, so this is what decides the cost of the walk:
+// one query per file meant a million queries an hour at a million blobs.
+var orphanBatchSize = 500
+
+type blobFile struct{ bucket, hash, path string }
+
+// reclaimOrphanBatch resolves a batch with one query per bucket, then
+// reclaims only the files that query did not account for. The bulk lookup is
+// a cheap pre-filter, not the safety check — reclaimOrphan still re-reads
+// each row inside its own transaction, which is what stops a concurrent PUT
+// from having its blob pulled out from under it.
+func (s *Store) reclaimOrphanBatch(ctx context.Context, batch []blobFile) (int, error) {
+	byBucket := map[string][]string{}
+	for _, f := range batch {
+		byBucket[f.bucket] = append(byBucket[f.bucket], f.hash)
+	}
+	known := map[string]map[string]bool{}
+	for bucket, hashes := range byBucket {
+		found, err := s.knownHashes(ctx, bucket, hashes)
+		if err != nil {
+			return 0, err
+		}
+		known[bucket] = found
+	}
+
+	reclaimed := 0
+	for _, f := range batch {
+		if known[f.bucket][f.hash] {
+			continue
 		}
 		if s.hookOrphanWindow != nil {
 			s.hookOrphanWindow()
 		}
-		moved, err := s.reclaimOrphan(ctx, bucket, hash, path)
+		moved, err := s.reclaimOrphan(ctx, f.bucket, f.hash, f.path)
 		if err != nil {
-			return err
+			return reclaimed, err
 		}
 		if moved {
 			reclaimed++
 			orphansReclaimed.Inc()
 		}
-		return nil
-	})
-	return reclaimed, err
+	}
+	return reclaimed, nil
+}
+
+// knownHashes returns which of hashes have a blobs row in bucket.
+func (s *Store) knownHashes(ctx context.Context, bucket string, hashes []string) (map[string]bool, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(hashes)+1)
+	args = append(args, bucket)
+	for _, h := range hashes {
+		args = append(args, h)
+	}
+	query := `SELECT hash FROM blobs WHERE bucket = ? AND hash IN (?` +
+		strings.Repeat(",?", len(hashes)-1) + `)`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	found := map[string]bool{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		found[h] = true
+	}
+	return found, rows.Err()
 }
 
 // reclaimOrphan moves one orphan under the write lock. The re-check inside

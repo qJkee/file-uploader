@@ -55,6 +55,7 @@ type Config struct {
 	SweepBudget    time.Duration
 	TmpMaxAge      time.Duration
 	TrashRetention time.Duration
+	MaxTrashBytes  int64
 }
 
 // ErrInvalidName is returned for a bucket or object ID that fails validation.
@@ -204,9 +205,19 @@ func Open(cfg Config) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	// Writers serialize anyway, so a small pool costs no write throughput and
+	// bounds memory: without a cap, every writer blocked on busy_timeout
+	// holds a connection and the count tracks concurrency with nothing
+	// stopping it. Reads share the pool, so a write storm can make a GET wait
+	// for a free connection — raise this if read latency matters more than
+	// the memory ceiling.
+	db.SetMaxOpenConns(maxOpenConns)
+
 	s.db = db
 	return s, nil
 }
+
+const maxOpenConns = 10
 
 func (s *Store) Close() error { return s.db.Close() }
 

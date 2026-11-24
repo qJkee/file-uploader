@@ -30,6 +30,7 @@ func run(args []string) error {
 	sweepBudget := fs.Duration("sweep-budget", 10*time.Second, "wall-clock cap on one sweep's reclaim loop")
 	tmpMaxAge := fs.Duration("tmp-max-age", time.Hour, "age at which an abandoned upload is removed; must exceed the longest plausible upload")
 	trashRetention := fs.Duration("trash-retention", 24*time.Hour, "how long reclaimed bytes survive in trash; 0 unlinks immediately")
+	maxTrashBytes := fs.Int64("max-trash-bytes", 2<<30, "evict oldest trash past this many bytes; 0 disables the cap")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -51,6 +52,7 @@ func run(args []string) error {
 		SweepBudget:    *sweepBudget,
 		TmpMaxAge:      *tmpMaxAge,
 		TrashRetention: *trashRetention,
+		MaxTrashBytes:  *maxTrashBytes,
 	})
 	if err != nil {
 		return err
@@ -128,11 +130,12 @@ func runSweeper(ctx context.Context, store *Store) {
 				slog.Error("sweep failed", "err", err)
 				continue
 			}
-			if res.Reclaimed > 0 || res.TrashDeleted > 0 || res.TmpDeleted > 0 {
+			if res.Reclaimed > 0 || res.TrashDeleted > 0 || res.TmpDeleted > 0 || res.Orphans > 0 {
 				slog.Info("sweep",
 					"candidates", res.Candidates, "reclaimed", res.Reclaimed,
 					"trash_deleted", res.TrashDeleted, "tmp_deleted", res.TmpDeleted,
-					"trash_files", res.TrashFiles, "trash_bytes", res.TrashBytes)
+					"trash_files", res.TrashFiles, "trash_bytes", res.TrashBytes,
+					"trash_evicted", res.TrashEvicted, "orphans", res.Orphans)
 			}
 		}
 	}

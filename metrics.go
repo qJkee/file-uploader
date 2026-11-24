@@ -80,6 +80,15 @@ var (
 		Help: "Bytes currently held in trash.",
 	})
 
+	// Nonzero means -max-trash-bytes is dropping deleted data earlier than
+	// -trash-retention promised, so the recovery window is shorter than it
+	// looks. Worth alerting on: the cap is protecting the disk by shrinking
+	// the safety net.
+	trashEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "objectstore_trash_evicted_total",
+		Help: "Trash entries removed by the size cap before their retention expired.",
+	})
+
 	// Not "startup": the walk runs once at boot and then periodically, since
 	// a PUT that rolls back after renaming its blob into place leaks a file
 	// the reclaim anti-join can never see.
@@ -100,6 +109,7 @@ func observeSweep(res SweepResult, err error, seconds float64) {
 	sweepDeletedTotal.Add(float64(res.Reclaimed))
 	// res.Orphans is not added here: SweepOrphans counts its own reclaims,
 	// because the startup walk does not come through a sweep at all.
+	trashEvictedTotal.Add(float64(res.TrashEvicted))
 	trashFiles.Set(float64(res.TrashFiles))
 	trashBytes.Set(float64(res.TrashBytes))
 

@@ -24,6 +24,7 @@ func newTestStore(t *testing.T) *Store {
 		SweepBudget:    10 * time.Second,
 		TmpMaxAge:      time.Hour,
 		TrashRetention: 24 * time.Hour,
+		MaxTrashBytes:  2 << 30,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
