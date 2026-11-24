@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -384,7 +385,10 @@ func TestReclaimSkipsAdoptedBlob(t *testing.T) {
 	}()
 
 	// Poll until a backend is blocked specifically by our blocker transaction.
-	deadline := time.Now().Add(5 * time.Second)
+	// The 2s deadline is safely under lock_timeout=5s: if the poll gives up,
+	// the test proved nothing, but it fails cleanly rather than racing the
+	// timeout and surfacing as a confusing 55P03.
+	deadline := time.Now().Add(2 * time.Second)
 	foundBlocked := false
 	for time.Now().Before(deadline) {
 		var blocked int
@@ -412,6 +416,11 @@ func TestReclaimSkipsAdoptedBlob(t *testing.T) {
 
 	// Wait for the sweep to complete.
 	if err := <-sweepErr; err != nil {
+		// If lock_timeout fired before the blocker committed, this is a test
+		// configuration error, not a sweep bug.
+		if strings.Contains(err.Error(), "55P03") {
+			t.Fatalf("Sweep: lock_timeout beat the test deadline — lower lock_timeout or raise poll deadline: %v", err)
+		}
 		t.Fatalf("Sweep: %v", err)
 	}
 	res := <-done

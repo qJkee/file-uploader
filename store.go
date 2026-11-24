@@ -193,6 +193,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	// (lock_not_available) and can retry. statement_timeout is insurance
 	// against runaway queries; every statement in this service is short, as
 	// file streaming does not touch the database.
+	//
+	// Under pool saturation a request can wait up to statement_timeout for a
+	// connection (the transitive bound: statement_timeout caps how long any
+	// connection stays occupied). There is no hard acquire timeout.
 	if poolCfg.ConnConfig.RuntimeParams == nil {
 		poolCfg.ConnConfig.RuntimeParams = make(map[string]string)
 	}

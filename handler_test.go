@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -120,9 +121,15 @@ func TestLockTimeoutActuallyFires(t *testing.T) {
 	}
 	defer tx2.Rollback(ctx)
 
+	start := time.Now()
 	_, err = tx2.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, "b1", "hotkey")
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected lock timeout, got success")
+	}
+
+	if elapsed < 4*time.Second || elapsed > 7*time.Second {
+		t.Errorf("lock timeout fired after %v, want ~5s", elapsed)
 	}
 
 	var pgErr *pgconn.PgError
