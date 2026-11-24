@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -91,6 +94,12 @@ func TestStatusForPostgresErrors(t *testing.T) {
 		{"serialization_failure", "40001", http.StatusServiceUnavailable},
 		{"lock_not_available", "55P03", http.StatusServiceUnavailable},
 		{"query_canceled", "57014", http.StatusServiceUnavailable},
+		// What a real outage sends, as opposed to what is easy to construct:
+		// 57P01 is every backend's farewell from a clean `pg_ctl stop`.
+		{"connection_failure", "08006", http.StatusServiceUnavailable},
+		{"connection_does_not_exist", "08003", http.StatusServiceUnavailable},
+		{"admin_shutdown", "57P01", http.StatusServiceUnavailable},
+		{"cannot_connect_now", "57P03", http.StatusServiceUnavailable},
 		{"unique_violation", "23505", http.StatusInternalServerError},
 	}
 	for _, c := range cases {
@@ -99,6 +108,160 @@ func TestStatusForPostgresErrors(t *testing.T) {
 			t.Errorf("statusFor(%s) = %d, want %d", c.name, got, c.want)
 		}
 	}
+
+	// A database that is simply not listening never produces a PgError at
+	// all, which is how it used to fall through to a generic 500 with no
+	// Retry-After.
+	down := realConnectError(t)
+	var connErr *pgconn.ConnectError
+	if !errors.As(down, &connErr) {
+		t.Fatalf("pgx returned %T for an unreachable server, want *pgconn.ConnectError: %v", down, down)
+	}
+	if got := statusFor(down); got != http.StatusServiceUnavailable {
+		t.Errorf("statusFor(database unreachable) = %d, want 503", got)
+	}
+}
+
+// realConnectError returns the error pgx produces when nothing is listening.
+// *pgconn.ConnectError keeps its cause unexported and its Error() dereferences
+// Config, so a literal is neither constructible nor safe to call — the only
+// honest way to cover this shape is to provoke one.
+func realConnectError(t *testing.T) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // the port is now known-free, so the dial is refused at once
+
+	conn, err := pgx.Connect(t.Context(), "postgres://objectstore@"+addr+"/objectstore")
+	if err == nil {
+		conn.Close(t.Context())
+		t.Fatalf("connected to %s, which nothing is listening on", addr)
+	}
+	return err
+}
+
+// tcpProxy forwards to a backend and can reset every connection it opened.
+// That is what a Postgres kill, an OOM or a failover looks like to a client
+// in the middle of a transaction, and it is not reproducible by closing the
+// pool: a clean close is a FIN, not an RST.
+type tcpProxy struct {
+	ln    net.Listener
+	mu    sync.Mutex
+	conns []*net.TCPConn
+}
+
+func newTCPProxy(t *testing.T, backend string) *tcpProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	p := &tcpProxy{ln: ln}
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return // listener closed
+			}
+			up, err := net.Dial("tcp", backend)
+			if err != nil {
+				down.Close()
+				continue
+			}
+			p.mu.Lock()
+			p.conns = append(p.conns, down.(*net.TCPConn))
+			p.mu.Unlock()
+			go func() { io.Copy(up, down); up.Close() }()
+			go func() { io.Copy(down, up); down.Close() }()
+		}
+	}()
+	t.Cleanup(func() { ln.Close(); p.reset() })
+	return p
+}
+
+// reset tears every connection down with RST rather than FIN, so the client
+// side surfaces ECONNRESET/EPIPE — the same error values a vanished HTTP
+// client produces, which is the whole difficulty.
+func (p *tcpProxy) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.conns {
+		c.SetLinger(0)
+		c.Close()
+	}
+	p.conns = nil
+}
+
+// TestDatabaseResetMidPutIsNotAnEmpty200 is the one that matters: the
+// database socket dies inside Put's transaction while the HTTP client is
+// still perfectly connected. statusFor sees ECONNRESET and says "client
+// gone, write nothing" — correct before the port, when that error could only
+// come from the request body. Writing nothing lets net/http complete the
+// response as 200 with an empty body and no ETag, and promhttp records a
+// 200: a success-shaped answer for a row that was never committed.
+func TestDatabaseResetMidPutIsNotAnEmpty200(t *testing.T) {
+	cfg := newTestConfig(t)
+	direct, err := url.Parse(cfg.DatabaseURL)
+	if err != nil {
+		t.Fatalf("parse database url: %v", err)
+	}
+	proxy := newTCPProxy(t, direct.Host)
+	through := *direct
+	through.Host = proxy.ln.Addr().String()
+	cfg.DatabaseURL = through.String()
+
+	s := openTestStore(t, cfg)
+	srv := httptest.NewServer(NewHandler(s).Mux())
+	t.Cleanup(srv.Close)
+
+	// Fires inside the transaction, after the objects row is written and
+	// before the commit that would make it real.
+	var once sync.Once
+	s.hookBeforeCommit = func() { once.Do(proxy.reset) }
+
+	resp, err := srv.Client().Do(mustRequest(t, http.MethodPut, srv.URL+"/objects/b1/a", "hello"))
+	if err != nil {
+		t.Fatalf("PUT: %v — the client's own connection must survive, or this test is measuring the wrong socket", err)
+	}
+	defer resp.Body.Close()
+	body := readBody(t, resp)
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		t.Fatalf("PUT answered %d etag=%q body=%q after the database connection was reset "+
+			"mid-transaction; nothing was committed", resp.StatusCode, resp.Header.Get("ETag"), body)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("PUT = %d, want 503 (body %q)", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want \"1\"", got)
+	}
+
+	// And the 503 told the truth: no row survived. Retried because the pool
+	// is still holding connections the reset killed and finds out one at a
+	// time.
+	ctx := context.WithoutCancel(t.Context())
+	var headErr error
+	for range 5 {
+		if _, headErr = s.Head(ctx, "b1", "a"); headErr == nil || errors.Is(headErr, ErrNotFound) {
+			break
+		}
+	}
+	if !errors.Is(headErr, ErrNotFound) {
+		t.Errorf("Head after the failed PUT = %v, want ErrNotFound — the response claimed nothing was stored", headErr)
+	}
+}
+
+func mustRequest(t *testing.T, method, url, body string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	return req
 }
 
 func TestLockTimeoutActuallyFires(t *testing.T) {

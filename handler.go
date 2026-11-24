@@ -216,6 +216,13 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	// did not enumerate.
 	if r.Context().Err() != nil {
 		status = 0
+	} else if status == 0 {
+		// The error is shaped like a vanished client, but this request's
+		// context is still live, so the socket that broke was the database's,
+		// not ours. Returning silently here would let net/http finish the
+		// response as a 200 with an empty body — a success-shaped answer, and
+		// a 200 in /metrics, for work that never happened.
+		status = http.StatusServiceUnavailable
 	}
 	if status == 0 {
 		// The client hung up. Nothing committed, the temp is gone, and there
@@ -241,6 +248,7 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 func statusFor(err error) int {
 	var maxBytes *http.MaxBytesError
 	var pgErr *pgconn.PgError
+	var connErr *pgconn.ConnectError
 
 	switch {
 	case err == nil:
@@ -258,6 +266,13 @@ func statusFor(err error) int {
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, syscall.ENOSPC):
 		return http.StatusInsufficientStorage
+	case errors.As(err, &connErr):
+		// The pool could not reach the database at all. pgx reports this as a
+		// ConnectError, never a PgError, so it must be matched by type or it
+		// falls through to a generic 500 with no Retry-After. Checked before
+		// the client-gone cases below because a ConnectError is by
+		// construction the database's socket, never the client's.
+		return http.StatusServiceUnavailable
 	case errors.Is(err, context.Canceled),
 		errors.Is(err, syscall.ECONNRESET),
 		errors.Is(err, syscall.EPIPE),
@@ -268,7 +283,13 @@ func statusFor(err error) int {
 		return 0
 	case errors.As(err, &pgErr):
 		switch pgErr.Code {
-		case "40001", "55P03", "57014":
+		// 40001 serialization_failure, 55P03 lock_not_available, 57014
+		// query_canceled: retry and it may well work. 08006/08003 are a
+		// connection that broke or was already closed; 57P01 admin_shutdown
+		// is what a clean `pg_ctl stop` sends every backend and 57P03
+		// cannot_connect_now is a server still starting up. All transient,
+		// none the client's fault.
+		case "40001", "55P03", "57014", "08006", "08003", "57P01", "57P03":
 			return http.StatusServiceUnavailable
 		default:
 			return http.StatusInternalServerError
