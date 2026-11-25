@@ -1,4 +1,4 @@
-module objectstore
+module github.com/qjkee/objectstore
 
 go 1.27.3
 

@@ -1,20 +1,20 @@
-package main
+package store
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
-	"net/http"
-	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/dbtest"
+	"github.com/qjkee/objectstore/pkg/etag"
+	"github.com/qjkee/objectstore/pkg/metrics"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -51,7 +51,7 @@ func assertConsistent(t *testing.T, s *Store, blobMissingBefore float64) {
 	if _, err := s.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	blobsRoot := filepath.Join(s.dataDir, "blobs")
+	blobsRoot := filepath.Join(s.DataDir(), "blobs")
 	err = walkFiles(t.Context(), blobsRoot, func(path string, _ fs.FileInfo) error {
 		bucket, hash, ok := parseBlobPath(blobsRoot, path)
 		if !ok {
@@ -74,63 +74,13 @@ func assertConsistent(t *testing.T, s *Store, blobMissingBefore float64) {
 	}
 
 	// 3. The invariant the locking design protects never broke.
-	if got := testutil.ToFloat64(blobMissingTotal) - blobMissingBefore; got != 0 {
+	if got := testutil.ToFloat64(metrics.BlobMissingTotal) - blobMissingBefore; got != 0 {
 		t.Errorf("blob_missing_total rose by %v during this test, want 0", got)
 	}
 }
 
-// TestRaceHarness runs mixed traffic against one server while the sweeper
-// chases the blob a PUT loop keeps recreating — the exact PUT/sweeper race
-// the foreign key exists to close.
-func TestRaceHarness(t *testing.T) {
-	before := testutil.ToFloat64(blobMissingTotal)
-	ts := newTestServer(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	for i := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			path := fmt.Sprintf("/objects/b1/obj-%d", i)
-			for n := 0; ctx.Err() == nil && n < 40; n++ {
-				ts.do(t, http.MethodPut, path, strings.NewReader(fmt.Sprintf("body-%d-%d", i, n)), nil)
-				ts.do(t, http.MethodGet, path, nil, nil)
-				if n%3 == 0 {
-					ts.do(t, http.MethodDelete, path, nil, nil)
-				}
-			}
-		}()
-	}
-
-	// One contender PUTs the same bytes over and over while the sweeper runs
-	// against exactly that hash.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for n := 0; ctx.Err() == nil && n < 100; n++ {
-			ts.do(t, http.MethodPut, "/objects/b1/contended", strings.NewReader("X"), nil)
-			ts.do(t, http.MethodDelete, "/objects/b1/contended", nil, nil)
-		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for n := 0; ctx.Err() == nil && n < 100; n++ {
-			if _, err := ts.store.Sweep(ctx); err != nil && ctx.Err() == nil {
-				t.Errorf("Sweep: %v", err)
-				return
-			}
-		}
-	}()
-	wg.Wait()
-
-	assertConsistent(t, ts.store, before)
-}
-
 func TestIdenticalContentStorm(t *testing.T) {
-	before := testutil.ToFloat64(blobMissingTotal)
+	before := testutil.ToFloat64(metrics.BlobMissingTotal)
 	s := newTestStore(t)
 	const n = 32
 
@@ -216,61 +166,6 @@ func (r *errReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestDiskFullIs507 pins the status mapping and the temp cleanup.
-//
-// shortcut: ENOSPC is injected from the body reader rather than the temp
-// file's writer, so this does not exercise a genuine filesystem-full write.
-// A tmpfs test would need Linux and root.
-func TestDiskFullIs507(t *testing.T) {
-	s := newTestStore(t)
-
-	_, err := s.Put(t.Context(), "b1", "a",
-		&errReader{remaining: 16, err: syscall.ENOSPC}, etag.Precondition{})
-
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("Put = %v, want ENOSPC", err)
-	}
-	if got := statusFor(err); got != http.StatusInsufficientStorage {
-		t.Errorf("statusFor = %d, want 507", got)
-	}
-	if n := countFiles(t, s.tmpDir()); n != 0 {
-		t.Errorf("temp files = %d, want 0", n)
-	}
-	if got := countBlobFiles(t, s); got != 0 {
-		t.Errorf("blob files = %d, want 0", got)
-	}
-}
-
-// TestPutCleansUpOnContextCancellation is the deterministic half of the
-// client-disconnect story: the store's own cleanup. It does NOT cover the
-// HTTP behaviour — it hands Put the one error value the code special-cases.
-// TestRealClientDisconnectMidPut aborts a real socket and is what pins "no
-// 5xx".
-func TestPutCleansUpOnContextCancellation(t *testing.T) {
-	s := newTestStore(t)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	body := io.MultiReader(
-		strings.NewReader("partial"),
-		&errReader{err: cancelAfter(cancel)},
-	)
-	_, err := s.Put(ctx, "b1", "a", body, etag.Precondition{})
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Put = %v, want context.Canceled", err)
-	}
-	if got := statusFor(err); got != 0 {
-		t.Errorf("statusFor = %d, want 0 — a vanished client gets no response", got)
-	}
-	if n := countFiles(t, s.tmpDir()); n != 0 {
-		t.Errorf("temp files = %d, want 0", n)
-	}
-	if _, err := s.Head(t.Context(), "b1", "a"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Head = %v, want ErrNotFound — nothing may commit", err)
-	}
-}
-
 func cancelAfter(cancel context.CancelFunc) error {
 	cancel()
 	return context.Canceled
@@ -293,7 +188,7 @@ func TestLostDatabase(t *testing.T) {
 
 	// The metadata is gone: a wrong -database-url, a bad restore, a dropped
 	// schema. Open recreates an empty one, which is the dangerous case.
-	execOnDatabase(t, cfg.DatabaseURL, `DROP TABLE objects, blobs`)
+	dbtest.ExecOnDatabase(t, cfg.DatabaseURL, `DROP TABLE objects, blobs`)
 
 	second, err := Open(t.Context(), cfg)
 	if err != nil {

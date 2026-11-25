@@ -1,10 +1,11 @@
-package main
+package api
 
 import (
 	"net/http"
-	"objectstore/pkg/etag"
 	"strings"
 	"testing"
+
+	"github.com/qjkee/objectstore/pkg/metrics"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -31,12 +32,12 @@ func TestMetricsEndpoint(t *testing.T) {
 
 func TestDedupHitCounter(t *testing.T) {
 	ts := newTestServer(t)
-	before := testutil.ToFloat64(dedupHitsTotal)
+	before := testutil.ToFloat64(metrics.DedupHitsTotal)
 
 	ts.put(t, "/objects/b1/a", "same bytes")
 	ts.put(t, "/objects/b1/b", "same bytes")
 
-	if got := testutil.ToFloat64(dedupHitsTotal) - before; got != 1 {
+	if got := testutil.ToFloat64(metrics.DedupHitsTotal) - before; got != 1 {
 		t.Errorf("dedup hits = %v, want 1", got)
 	}
 }
@@ -72,39 +73,16 @@ func TestHealthzFailsOnAClosedStore(t *testing.T) {
 		t.Errorf("GET /healthz on a closed pool = %d, want 503", got)
 	}
 }
-
-func TestSweepMetrics(t *testing.T) {
-	s := newTestStore(t)
-	before := testutil.ToFloat64(sweepDeletedTotal)
-	beforeRuns := testutil.ToFloat64(sweepRunsTotal.WithLabelValues("success"))
-	mustPut(t, s, "b1", "a", "hello")
-	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-
-	mustSweep(t, s)
-
-	if got := testutil.ToFloat64(sweepDeletedTotal) - before; got != 1 {
-		t.Errorf("sweep_deleted_total delta = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(sweepRunsTotal.WithLabelValues("success")) - beforeRuns; got != 1 {
-		t.Errorf("sweep_runs_total{success} delta = %v, want 1", got)
-	}
-	if testutil.ToFloat64(sweepLastSuccess) == 0 {
-		t.Error("sweep_last_success_timestamp_seconds was never set")
-	}
-}
-
 func TestBlobMissingCounter(t *testing.T) {
 	ts := newTestServer(t)
 	ts.put(t, "/objects/b1/a", "hello")
-	before := testutil.ToFloat64(blobMissingTotal)
+	before := testutil.ToFloat64(metrics.BlobMissingTotal)
 	unlinkBlob(t, ts.store, "b1", "hello")
 
 	if got := ts.do(t, http.MethodGet, "/objects/b1/a", nil, nil).StatusCode; got != http.StatusInternalServerError {
 		t.Errorf("GET with a missing blob = %d, want 500", got)
 	}
-	if got := testutil.ToFloat64(blobMissingTotal) - before; got != 1 {
+	if got := testutil.ToFloat64(metrics.BlobMissingTotal) - before; got != 1 {
 		t.Errorf("blob_missing_total delta = %v, want 1", got)
 	}
 }

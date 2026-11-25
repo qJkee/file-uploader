@@ -12,6 +12,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/api"
+	"github.com/qjkee/objectstore/pkg/store"
 )
 
 var (
@@ -46,7 +49,7 @@ func run(args []string) error {
 	if *data == "" {
 		return errDataRequired
 	}
-	if strings.TrimSpace(*databaseURL) == "" {
+	if *databaseURL == "" {
 		return errDatabaseURLRequired
 	}
 
@@ -59,7 +62,7 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	store, err := Open(ctx, Config{
+	store, err := store.Open(ctx, store.Config{
 		DataDir:        *data,
 		DatabaseURL:    *databaseURL,
 		MaxObjectSize:  *maxObjectSize,
@@ -93,7 +96,7 @@ func run(args []string) error {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: NewHandler(store).Mux(),
+		Handler: api.NewHandler(store).Mux(),
 		// Slowloris protection. There is deliberately no WriteTimeout and no
 		// ReadTimeout: either would abort a legitimate slow transfer of a
 		// max-size object mid-flight. MaxBytesReader bounds uploads by size
@@ -126,8 +129,8 @@ func run(args []string) error {
 	return err
 }
 
-func runSweeper(ctx context.Context, store *Store) {
-	ticker := time.NewTicker(store.cfg.SweepInterval)
+func runSweeper(ctx context.Context, store *store.Store) {
+	ticker := time.NewTicker(store.Config().SweepInterval)
 	defer ticker.Stop()
 	for {
 		select {

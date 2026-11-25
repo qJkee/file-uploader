@@ -1,11 +1,8 @@
-package main
+package store
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"math/rand/v2"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,59 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/qjkee/objectstore/pkg/dbtest"
 )
-
-// testDatabaseURL is the live Postgres every test needs. It fails rather than
-// skips: a silently skipped concurrency suite is how this port ships broken.
-func testDatabaseURL(tb testing.TB) string {
-	tb.Helper()
-	u := os.Getenv("OBJECTSTORE_TEST_DATABASE_URL")
-	if u == "" {
-		tb.Fatal("OBJECTSTORE_TEST_DATABASE_URL is unset; these tests need a live Postgres, e.g. " +
-			"OBJECTSTORE_TEST_DATABASE_URL=postgres://objectstore:objectstore@localhost:15432/objectstore")
-	}
-	return u
-}
-
-// newTestSchema creates a private schema and returns a URL pointing every
-// connection's search_path at it. pgx forwards unrecognised query parameters
-// as startup RuntimeParams, so this covers every connection the pool opens
-// and not merely the first — TestSearchPathAppliesToEveryPooledConnection
-// pins that.
-func newTestSchema(tb testing.TB) string {
-	tb.Helper()
-	base := testDatabaseURL(tb)
-	name := fmt.Sprintf("test_%016x", rand.Uint64())
-	quoted := pgx.Identifier{name}.Sanitize()
-
-	execOnDatabase(tb, base, "CREATE SCHEMA "+quoted)
-	tb.Cleanup(func() { execOnDatabase(tb, base, "DROP SCHEMA "+quoted+" CASCADE") })
-
-	u, err := url.Parse(base)
-	if err != nil {
-		tb.Fatalf("parse %s: %v", base, err)
-	}
-	q := u.Query()
-	q.Set("search_path", name)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-// execOnDatabase runs one statement on a connection of its own, outside any
-// Store's pool.
-func execOnDatabase(tb testing.TB, databaseURL, sql string) {
-	tb.Helper()
-	ctx := context.WithoutCancel(tb.Context()) // cleanup runs after the test context is cancelled
-	conn, err := pgx.Connect(ctx, databaseURL)
-	if err != nil {
-		tb.Fatalf("connect: %v", err)
-	}
-	defer conn.Close(ctx)
-	if _, err := conn.Exec(ctx, sql); err != nil {
-		tb.Fatalf("exec %q: %v", sql, err)
-	}
-}
 
 // newTestConfig gives a Store a fresh temp dir and a private Postgres schema,
 // with production-shaped defaults. Tests that care about a specific duration
@@ -75,7 +21,7 @@ func newTestConfig(tb testing.TB) Config {
 	tb.Helper()
 	return Config{
 		DataDir:        tb.TempDir(),
-		DatabaseURL:    newTestSchema(tb),
+		DatabaseURL:    dbtest.NewSchemaURL(tb),
 		MaxObjectSize:  32 << 20,
 		SweepInterval:  time.Minute,
 		SweepBudget:    10 * time.Second,
@@ -162,14 +108,14 @@ func TestValidateBucket(t *testing.T) {
 	}
 
 	for _, b := range accept {
-		if err := validateBucket(b); err != nil {
-			t.Errorf("validateBucket(%q) = %v, want nil", b, err)
+		if err := ValidateBucket(b); err != nil {
+			t.Errorf("ValidateBucket(%q) = %v, want nil", b, err)
 		}
 	}
 	for _, b := range reject {
-		err := validateBucket(b)
+		err := ValidateBucket(b)
 		if !errors.Is(err, ErrInvalidName) {
-			t.Errorf("validateBucket(%q) = %v, want ErrInvalidName", b, err)
+			t.Errorf("ValidateBucket(%q) = %v, want ErrInvalidName", b, err)
 		}
 	}
 }
@@ -182,14 +128,14 @@ func TestValidateObjectID(t *testing.T) {
 	}
 
 	for _, id := range accept {
-		if err := validateObjectID(id); err != nil {
-			t.Errorf("validateObjectID(%q) = %v, want nil", id, err)
+		if err := ValidateObjectID(id); err != nil {
+			t.Errorf("ValidateObjectID(%q) = %v, want nil", id, err)
 		}
 	}
 	for _, id := range reject {
-		err := validateObjectID(id)
+		err := ValidateObjectID(id)
 		if !errors.Is(err, ErrInvalidName) {
-			t.Errorf("validateObjectID(%q) = %v, want ErrInvalidName", id, err)
+			t.Errorf("ValidateObjectID(%q) = %v, want ErrInvalidName", id, err)
 		}
 	}
 }
@@ -218,7 +164,7 @@ func TestBlobPathFanout(t *testing.T) {
 func TestOpenCreatesLayout(t *testing.T) {
 	s := newTestStore(t)
 	for _, name := range []string{"blobs", "tmp", "trash"} {
-		if _, err := os.Stat(filepath.Join(s.dataDir, name)); err != nil {
+		if _, err := os.Stat(filepath.Join(s.DataDir(), name)); err != nil {
 			t.Errorf("missing %s: %v", name, err)
 		}
 	}

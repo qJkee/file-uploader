@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/metrics"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -424,7 +426,7 @@ func (s *Store) reclaimOrphanBatch(ctx context.Context, batch []blobFile) (int, 
 		}
 		if moved {
 			reclaimed++
-			orphansReclaimed.Inc()
+			metrics.OrphansReclaimed.Inc()
 		}
 	}
 	return reclaimed, nil
@@ -566,4 +568,27 @@ func walkFiles(ctx context.Context, root string, fn func(path string, info fs.Fi
 		return nil
 	}
 	return err
+}
+
+// ObserveSweep records what the sweep actually did, whether or not it also
+// returned an error. The three passes run independently so one unmovable
+// file cannot stop the others — discarding their counts here would undo
+// that, and metrics.SweepDeletedTotal is a counter, so a skipped increment is lost
+// for good rather than caught up on the next pass.
+func observeSweep(res SweepResult, err error, seconds float64) {
+	metrics.SweepDuration.Observe(seconds)
+	metrics.SweepCandidates.Set(float64(res.Candidates))
+	metrics.SweepDeletedTotal.Add(float64(res.Reclaimed))
+	// res.Orphans is not added here: SweepOrphans counts its own reclaims,
+	// because the startup walk does not come through a sweep at all.
+	metrics.TrashEvictedTotal.Add(float64(res.TrashEvicted))
+	metrics.TrashFiles.Set(float64(res.TrashFiles))
+	metrics.TrashBytes.Set(float64(res.TrashBytes))
+
+	if err != nil {
+		metrics.SweepRunsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	metrics.SweepRunsTotal.WithLabelValues("success").Inc()
+	metrics.SweepLastSuccess.SetToCurrentTime()
 }

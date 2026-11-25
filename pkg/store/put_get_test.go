@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"crypto/sha256"
@@ -6,11 +6,12 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/qjkee/objectstore/pkg/etag"
 )
 
 func mustPut(t *testing.T, s *Store, bucket, objectID, body string) PutResult {
@@ -38,7 +39,7 @@ func mustGet(t *testing.T, s *Store, bucket, objectID string) string {
 
 func countBlobFiles(t *testing.T, s *Store) int {
 	t.Helper()
-	return countFiles(t, filepath.Join(s.dataDir, "blobs"))
+	return countFiles(t, filepath.Join(s.DataDir(), "blobs"))
 }
 
 func countFiles(t *testing.T, root string) int {

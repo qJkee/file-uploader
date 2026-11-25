@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +15,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/etag"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -76,14 +77,14 @@ var bucketRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 // visible name.
 var objectIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,255}$`)
 
-func validateBucket(b string) error {
+func ValidateBucket(b string) error {
 	if !bucketRe.MatchString(b) {
 		return fmt.Errorf("%w: bucket %q", ErrInvalidName, b)
 	}
 	return nil
 }
 
-func validateObjectID(id string) error {
+func ValidateObjectID(id string) error {
 	if !objectIDRe.MatchString(id) || id == "." || id == ".." {
 		return fmt.Errorf("%w: object id %q", ErrInvalidName, id)
 	}
@@ -353,10 +354,10 @@ type PutResult struct {
 // which the sweeper collects; the reverse would leave a row pointing at
 // nothing — a 500 for an object the client was told was stored.
 func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader, pre etag.Precondition) (PutResult, error) {
-	if err := validateBucket(bucket); err != nil {
+	if err := ValidateBucket(bucket); err != nil {
 		return PutResult{}, err
 	}
-	if err := validateObjectID(objectID); err != nil {
+	if err := ValidateObjectID(objectID); err != nil {
 		return PutResult{}, err
 	}
 
@@ -467,10 +468,10 @@ func (s *Store) Put(ctx context.Context, bucket, objectID string, body io.Reader
 // preconditions existed: splitting the SELECT and the DELETE across a
 // transaction boundary would be check-then-act, and DELETE is not a hot path.
 func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre etag.Precondition) error {
-	if err := validateBucket(bucket); err != nil {
+	if err := ValidateBucket(bucket); err != nil {
 		return err
 	}
-	if err := validateObjectID(objectID); err != nil {
+	if err := ValidateObjectID(objectID); err != nil {
 		return err
 	}
 
@@ -514,10 +515,10 @@ func (s *Store) Delete(ctx context.Context, bucket, objectID string, pre etag.Pr
 
 // Head returns the current content hash of an object.
 func (s *Store) Head(ctx context.Context, bucket, objectID string) (string, error) {
-	if err := validateBucket(bucket); err != nil {
+	if err := ValidateBucket(bucket); err != nil {
 		return "", err
 	}
-	if err := validateObjectID(objectID); err != nil {
+	if err := ValidateObjectID(objectID); err != nil {
 		return "", err
 	}
 	return s.lookup(ctx, bucket, objectID)
@@ -538,10 +539,10 @@ func (s *Store) lookup(ctx context.Context, bucket, objectID string) (string, er
 // Once it is open a sweeper unlink cannot break the transfer: on POSIX an open
 // fd stays valid after the directory entry is gone.
 func (s *Store) Get(ctx context.Context, bucket, objectID string) (*os.File, string, error) {
-	if err := validateBucket(bucket); err != nil {
+	if err := ValidateBucket(bucket); err != nil {
 		return nil, "", err
 	}
-	if err := validateObjectID(objectID); err != nil {
+	if err := ValidateObjectID(objectID); err != nil {
 		return nil, "", err
 	}
 
@@ -602,3 +603,38 @@ func fsyncDir(path string) error {
 	}
 	return nil
 }
+
+// ValidateNames rejects a bucket or object ID that fails validation, so the
+// HTTP layer can answer 400 before reading a body.
+func ValidateNames(bucket, objectID string) error {
+	if err := ValidateBucket(bucket); err != nil {
+		return err
+	}
+	return ValidateObjectID(objectID)
+}
+
+// Config returns a copy of the configuration this Store was opened with.
+// A copy, not the field: callers read it to size limits and schedule work,
+// and mutating a live Store's configuration is not supported.
+func (s *Store) Config() Config { return s.cfg }
+
+// TmpDir is the directory in-flight uploads are staged in. Exported so tests
+// in other packages can assert that an aborted upload left nothing behind.
+func (s *Store) TmpDir() string { return s.tmpDir() }
+
+// SetBeforeCommitHook installs a test seam that fires inside Put's
+// transaction, after the blob is renamed into place and before the commit.
+// It is the window a crash would land in. Production never calls this; it
+// exists because the tests that need it drive HTTP and so cannot live in
+// this package.
+func (s *Store) SetBeforeCommitHook(fn func()) { s.hookBeforeCommit = fn }
+
+// BlobPath is where the bytes of a given content hash live in a bucket. It
+// is a pure function of (bucket, hash) and is part of the public surface
+// because the documented recovery procedure — renaming a file back out of
+// trash — needs to name it.
+func (s *Store) BlobPath(bucket, hash string) string { return s.blobPath(bucket, hash) }
+
+// DataDir is the root the blob tree, temp staging and trash live under.
+// Exported for tests and tooling that need to inspect the layout.
+func (s *Store) DataDir() string { return s.dataDir }

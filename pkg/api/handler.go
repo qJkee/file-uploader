@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"context"
@@ -6,10 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"objectstore/pkg/etag"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/etag"
+	"github.com/qjkee/objectstore/pkg/metrics"
+	"github.com/qjkee/objectstore/pkg/store"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,14 +20,14 @@ import (
 )
 
 // Handler serves the object API. It owns no state beyond the store and the
-// size limit; everything durable lives behind Store.
+// size limit; everything durable lives behind store.Store.
 type Handler struct {
-	store         *Store
+	store         *store.Store
 	maxObjectSize int64
 }
 
-func NewHandler(s *Store) *Handler {
-	return &Handler{store: s, maxObjectSize: s.cfg.MaxObjectSize}
+func NewHandler(s *store.Store) *Handler {
+	return &Handler{store: s, maxObjectSize: s.Config().MaxObjectSize}
 }
 
 func (h *Handler) Mux() *http.ServeMux {
@@ -33,7 +36,6 @@ func (h *Handler) Mux() *http.ServeMux {
 	mux.Handle("GET /objects/{bucket}/{objectID}", instrument("GET", http.HandlerFunc(h.get)))
 	mux.Handle("DELETE /objects/{bucket}/{objectID}", instrument("DELETE", http.HandlerFunc(h.delete)))
 	mux.Handle("GET /metrics", promhttp.Handler())
-	mux.HandleFunc("GET /healthz", h.health)
 	return mux
 }
 
@@ -42,31 +44,15 @@ func (h *Handler) Mux() *http.ServeMux {
 // request, so it cannot be driven by a client.
 func instrument(method string, next http.Handler) http.Handler {
 	return promhttp.InstrumentHandlerDuration(
-		requestDuration.MustCurryWith(prometheus.Labels{"method": method}),
+		metrics.RequestDuration.MustCurryWith(prometheus.Labels{"method": method}),
 		promhttp.InstrumentHandlerCounter(
-			requestsTotal.MustCurryWith(prometheus.Labels{"method": method}),
+			metrics.RequestsTotal.MustCurryWith(prometheus.Labels{"method": method}),
 			next))
-}
-
-// health reports ready when the metadata database answers.
-//
-// It deliberately does no filesystem work. The endpoint is unauthenticated
-// and callers cannot be made to back off, so a write probe per request turns
-// a trickle of traffic into heavy disk load for free. An unwritable data
-// directory still surfaces immediately: PUTs fail with 507 and the sweeper
-// errors, both of which are visible in /metrics.
-func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
-	var one int
-	if err := h.store.Pool().QueryRow(r.Context(), `SELECT 1`).Scan(&one); err != nil {
-		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 	bucket, objectID := r.PathValue("bucket"), r.PathValue("objectID")
-	if err := validateNames(bucket, objectID); err != nil {
+	if err := store.ValidateNames(bucket, objectID); err != nil {
 		h.fail(w, r, err)
 		return
 	}
@@ -96,9 +82,9 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	putBytesTotal.Add(float64(res.Size))
+	metrics.PutBytesTotal.Add(float64(res.Size))
 	if res.Dedup {
-		dedupHitsTotal.Inc()
+		metrics.DedupHitsTotal.Inc()
 	}
 
 	w.Header().Set("ETag", etagOf(res.Hash))
@@ -111,7 +97,7 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	bucket, objectID := r.PathValue("bucket"), r.PathValue("objectID")
-	if err := validateNames(bucket, objectID); err != nil {
+	if err := store.ValidateNames(bucket, objectID); err != nil {
 		h.fail(w, r, err)
 		return
 	}
@@ -140,7 +126,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 	bucket, objectID := r.PathValue("bucket"), r.PathValue("objectID")
-	if err := validateNames(bucket, objectID); err != nil {
+	if err := store.ValidateNames(bucket, objectID); err != nil {
 		h.fail(w, r, err)
 		return
 	}
@@ -192,19 +178,12 @@ func (h *Handler) precheck(r *http.Request, bucket, objectID string, pre etag.Pr
 	}
 	hash, err := h.store.Head(r.Context(), bucket, objectID)
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, store.ErrNotFound):
 		return pre.Check("", false)
 	case err != nil:
 		return err
 	}
 	return pre.Check(hash, true)
-}
-
-func validateNames(bucket, objectID string) error {
-	if err := validateBucket(bucket); err != nil {
-		return err
-	}
-	return validateObjectID(objectID)
 }
 
 func etagOf(hash string) string { return `"` + hash + `"` }
@@ -254,14 +233,14 @@ func statusFor(err error) int {
 	switch {
 	case err == nil:
 		return http.StatusOK
-	case errors.Is(err, ErrInvalidName):
+	case errors.Is(err, store.ErrInvalidName):
 		return http.StatusBadRequest
 	case errors.Is(err, etag.ErrPrecondition):
 		return http.StatusPreconditionFailed
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrBlobMissing):
-		blobMissingTotal.Inc()
+	case errors.Is(err, store.ErrBlobMissing):
+		metrics.BlobMissingTotal.Inc()
 		return http.StatusInternalServerError
 	case errors.As(err, &maxBytes):
 		return http.StatusRequestEntityTooLarge

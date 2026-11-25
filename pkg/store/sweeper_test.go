@@ -1,16 +1,20 @@
-package main
+package store
 
 import (
 	"fmt"
-	"objectstore/pkg/etag"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/etag"
+	"github.com/qjkee/objectstore/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func trashRoot(s *Store) string { return filepath.Join(s.dataDir, "trash") }
+func trashRoot(s *Store) string { return filepath.Join(s.DataDir(), "trash") }
 
 func mustSweep(t *testing.T, s *Store) SweepResult {
 	t.Helper()
@@ -452,5 +456,27 @@ func TestReclaimSkipsAdoptedBlob(t *testing.T) {
 	// Verify the object is readable via the adopted row.
 	if got := mustGet(t, s, "b1", "adopted"); got != "adopted" {
 		t.Errorf("adopted object = %q, want %q", got, "adopted")
+	}
+}
+
+func TestSweepMetrics(t *testing.T) {
+	s := newTestStore(t)
+	before := testutil.ToFloat64(metrics.SweepDeletedTotal)
+	beforeRuns := testutil.ToFloat64(metrics.SweepRunsTotal.WithLabelValues("success"))
+	mustPut(t, s, "b1", "a", "hello")
+	if err := s.Delete(t.Context(), "b1", "a", etag.Precondition{}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	mustSweep(t, s)
+
+	if got := testutil.ToFloat64(metrics.SweepDeletedTotal) - before; got != 1 {
+		t.Errorf("sweep_deleted_total delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SweepRunsTotal.WithLabelValues("success")) - beforeRuns; got != 1 {
+		t.Errorf("sweep_runs_total{success} delta = %v, want 1", got)
+	}
+	if testutil.ToFloat64(metrics.SweepLastSuccess) == 0 {
+		t.Error("sweep_last_success_timestamp_seconds was never set")
 	}
 }

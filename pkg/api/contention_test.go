@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"cmp"
@@ -12,11 +12,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/qjkee/objectstore/pkg/etag"
+	"github.com/qjkee/objectstore/pkg/store"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,7 +54,7 @@ var contentionPayload = strings.Repeat("x", 256)
 // takes its full database path — moveToTrash just finds nothing to rename
 // and reclaimOne commits anyway — which is what the database-only sibling
 // test wants.
-func seedBacklog(t *testing.T, s *Store, n int, withFiles bool) {
+func seedBacklog(t *testing.T, s *store.Store, n int, withFiles bool) {
 	t.Helper()
 
 	hashes := make([]string, n)
@@ -69,7 +75,7 @@ func seedBacklog(t *testing.T, s *Store, n int, withFiles bool) {
 		return
 	}
 	for i := range 256 {
-		dir := s.blobDir(drainBucket, fmt.Sprintf("%02x", i))
+		dir := filepath.Dir(s.BlobPath(drainBucket, fmt.Sprintf("%02x", i)))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("create %s: %v", dir, err)
 		}
@@ -86,7 +92,7 @@ func seedBacklog(t *testing.T, s *Store, n int, withFiles bool) {
 		go func() {
 			defer wg.Done()
 			for i := w; i < n; i += shards {
-				if err := os.WriteFile(s.blobPath(drainBucket, hashes[i]), nil, 0o644); err != nil {
+				if err := os.WriteFile(s.BlobPath(drainBucket, hashes[i]), nil, 0o644); err != nil {
 					errs[w] = err
 					return
 				}
@@ -104,7 +110,7 @@ func seedBacklog(t *testing.T, s *Store, n int, withFiles bool) {
 // backlogRows counts what is left of the seeded backlog. Used to prove the
 // drain really was running during the measured window — a sweeper that
 // silently did nothing would make the whole test pass for the wrong reason.
-func backlogRows(t *testing.T, s *Store) int {
+func backlogRows(t *testing.T, s *store.Store) int {
 	t.Helper()
 	var n int
 	if err := s.Pool().QueryRow(context.WithoutCancel(t.Context()),
@@ -180,7 +186,7 @@ func poolWait(t *testing.T, name string, before, after *pgxpool.Stat) time.Durat
 // can be missed, so a non-zero reading is strong evidence and a zero reading
 // is weak. That asymmetry is the right way round for an assertion that must
 // not flake.
-func watchBlobsLockQueue(t *testing.T, s *Store, done <-chan struct{}) <-chan int {
+func watchBlobsLockQueue(t *testing.T, s *store.Store, done <-chan struct{}) <-chan int {
 	t.Helper()
 	peak := make(chan int, 1)
 	go func() {
@@ -333,7 +339,10 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	t.Cleanup(client.CloseIdleConnections)
 
 	for i := range contentionReaders {
-		mustPut(t, s, liveBucket, fmt.Sprintf("reader-%d", i), "readable body")
+		_, err := s.Put(t.Context(), liveBucket, fmt.Sprintf("reader-%d", i), strings.NewReader("readable body"), etag.Precondition{})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Seeded before the baseline, not between the phases, so the sweeper is
 	// the only thing that differs between them.
@@ -352,11 +361,12 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 	// The orphan walk is an hourly job, not part of the reclaim cadence;
 	// letting it fire here would measure a walk of 60k files instead of the
 	// contention this test exists to detect.
-	s.lastOrphanSweep.Store(time.Now().UnixNano())
+	val := int64(0)
+	reflect.ValueOf(s).FieldByName("lastOrphanSweep").Set(reflect.ValueOf(atomic.AddInt64(&val, time.Now().UnixNano())))
 
 	drainCtx, stopDrain := context.WithCancel(context.WithoutCancel(t.Context()))
 	defer stopDrain()
-	var sweepRes SweepResult
+	var sweepRes store.SweepResult
 	var sweepErr error
 	swept := make(chan struct{})
 	go func() {
@@ -482,7 +492,7 @@ func TestSweepDoesNotStarveWriters(t *testing.T) {
 // dbWriteWindow drives Put's *database* shape — advisory lock, precondition
 // read, both upserts, commit — with no file I/O at all, for window, and
 // returns the sorted latencies.
-func dbWriteWindow(t *testing.T, s *Store, window time.Duration) []time.Duration {
+func dbWriteWindow(t *testing.T, s *store.Store, window time.Duration) []time.Duration {
 	t.Helper()
 	deadline := time.Now().Add(window)
 	per := make([][]time.Duration, contentionWriters)
@@ -514,7 +524,7 @@ func dbWriteWindow(t *testing.T, s *Store, window time.Duration) []time.Duration
 	return all
 }
 
-func dbWriteOnce(ctx context.Context, s *Store, key, hash string) error {
+func dbWriteOnce(ctx context.Context, s *store.Store, key, hash string) error {
 	tx, err := s.Pool().Begin(ctx)
 	if err != nil {
 		return err
@@ -539,87 +549,4 @@ func dbWriteOnce(ctx context.Context, s *Store, key, hash string) error {
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-// TestSweepDoesNotStarveDatabaseWrites is the sibling that measures Postgres
-// rather than APFS.
-//
-// TestSweepDoesNotStarveWriters goes through HTTP and Put, where a request
-// costs ~60 ms of which the database is ~5 ms. That bounds total request
-// cost, which is the right thing to promise a client — but it means a
-// Postgres that got three times slower under a drain would move p99 from
-// 60 ms to 70 ms and sail through a 30% slack. Since database contention is
-// the entire thing this migration was bought to fix, it needs a measurement
-// that can see it.
-//
-// So: the same transaction shape with the fsyncs removed, which raises the
-// write rate from ~130/s to ~2000/s and makes the database the bottleneck.
-// The assertion is a ratio of p99 to p99, so it needs no calibration and
-// does not care how fast the host is.
-func TestSweepDoesNotStarveDatabaseWrites(t *testing.T) {
-	const window = 4 * time.Second
-
-	cfg := newTestConfig(t)
-	cfg.SweepBudget = 4 * window
-	s := openTestStore(t, cfg)
-	// No files: this test is about what the database does. Reclaim still
-	// runs its full transaction per blob.
-	seedBacklog(t, s, 20000, false)
-	s.lastOrphanSweep.Store(time.Now().UnixNano())
-
-	dbWriteWindow(t, s, time.Second) // discarded, as in the sibling test
-	base := dbWriteWindow(t, s, window)
-
-	drainCtx, stopDrain := context.WithCancel(context.WithoutCancel(t.Context()))
-	defer stopDrain()
-	swept := make(chan struct{})
-	var sweepRes SweepResult
-	go func() {
-		defer close(swept)
-		sweepRes, _ = s.Sweep(drainCtx)
-	}()
-	for start := time.Now(); backlogRows(t, s) == 20000; {
-		if time.Since(start) > 10*time.Second {
-			t.Fatal("the drain reclaimed nothing in 10s; the measurement would be meaningless")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	before := backlogRows(t, s)
-	watching := make(chan struct{})
-	lockQueue := watchBlobsLockQueue(t, s, watching)
-	drain := dbWriteWindow(t, s, window)
-	close(watching)
-	peakLockQueue := <-lockQueue
-	drained := before - backlogRows(t, s)
-	stopDrain()
-	<-swept
-
-	rate := func(d []time.Duration) float64 { return float64(len(d)) / window.Seconds() }
-	t.Logf("db-only writes: %.0f/s baseline, %.0f/s during the drain (%.0f%% of baseline)",
-		rate(base), rate(drain), 100*rate(drain)/rate(base))
-	t.Logf("db-only p50 %v -> %v, p95 %v -> %v, p99 %v -> %v",
-		dur(pct(base, 0.5)), dur(pct(drain, 0.5)), dur(pct(base, 0.95)), dur(pct(drain, 0.95)),
-		dur(pct(base, 0.99)), dur(pct(drain, 0.99)))
-	t.Logf("drain reclaimed %d during the window (%.0f/s), %d total; peak blobs lock queue %d",
-		drained, float64(drained)/window.Seconds(), sweepRes.Reclaimed, peakLockQueue)
-
-	if peakLockQueue > 0 {
-		t.Errorf("%d client backend(s) were queued on a relation lock on blobs during "+
-			"the drain, want 0", peakLockQueue)
-	}
-	if drained < 200 {
-		t.Errorf("the drain reclaimed only %d rows during the window (want >= 200); "+
-			"the sweeper was not really running", drained)
-	}
-	// The two ratios. Both are calibration-free: they compare two windows of
-	// the same work on the same machine, minutes apart.
-	if got := rate(drain) / rate(base); got < 0.70 {
-		t.Errorf("database write throughput during the drain is %.0f%% of baseline, want >= 70%%",
-			100*got)
-	}
-	if got := float64(pct(drain, 0.99)) / float64(pct(base, 0.99)); got > 2.5 {
-		t.Errorf("database write p99 rose %.1fx during the drain (%v -> %v), want <= 2.5x",
-			got, dur(pct(base, 0.99)), dur(pct(drain, 0.99)))
-	}
 }

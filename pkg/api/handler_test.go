@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"context"
@@ -14,13 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qjkee/objectstore/pkg/store"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type testServer struct {
 	*httptest.Server
-	store *Store
+	store *store.Store
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -68,9 +70,9 @@ func TestStatusFor(t *testing.T) {
 		err  error
 		want int
 	}{
-		{"invalid name", ErrInvalidName, http.StatusBadRequest},
-		{"not found", ErrNotFound, http.StatusNotFound},
-		{"blob missing", ErrBlobMissing, http.StatusInternalServerError},
+		{"invalid name", store.ErrInvalidName, http.StatusBadRequest},
+		{"not found", store.ErrNotFound, http.StatusNotFound},
+		{"blob missing", store.ErrBlobMissing, http.StatusInternalServerError},
 		{"disk full", syscall.ENOSPC, http.StatusInsufficientStorage},
 		{"client gone", context.Canceled, 0},
 		{"connection reset", syscall.ECONNRESET, 0},
@@ -124,7 +126,7 @@ func TestStatusForPostgresErrors(t *testing.T) {
 
 // realConnectError returns the error pgx produces when nothing is listening.
 // *pgconn.ConnectError keeps its cause unexported and its Error() dereferences
-// Config, so a literal is neither constructible nor safe to call — the only
+// store.Config, so a literal is neither constructible nor safe to call — the only
 // honest way to cover this shape is to provoke one.
 func realConnectError(t *testing.T) error {
 	t.Helper()
@@ -220,7 +222,7 @@ func TestDatabaseResetMidPutIsNotAnEmpty200(t *testing.T) {
 	// Fires inside the transaction, after the objects row is written and
 	// before the commit that would make it real.
 	var once sync.Once
-	s.hookBeforeCommit = func() { once.Do(proxy.reset) }
+	s.SetBeforeCommitHook(func() { once.Do(proxy.reset) })
 
 	resp, err := srv.Client().Do(mustRequest(t, http.MethodPut, srv.URL+"/objects/b1/a", "hello"))
 	if err != nil {
@@ -246,12 +248,12 @@ func TestDatabaseResetMidPutIsNotAnEmpty200(t *testing.T) {
 	ctx := context.WithoutCancel(t.Context())
 	var headErr error
 	for range 5 {
-		if _, headErr = s.Head(ctx, "b1", "a"); headErr == nil || errors.Is(headErr, ErrNotFound) {
+		if _, headErr = s.Head(ctx, "b1", "a"); headErr == nil || errors.Is(headErr, store.ErrNotFound) {
 			break
 		}
 	}
-	if !errors.Is(headErr, ErrNotFound) {
-		t.Errorf("Head after the failed PUT = %v, want ErrNotFound — the response claimed nothing was stored", headErr)
+	if !errors.Is(headErr, store.ErrNotFound) {
+		t.Errorf("Head after the failed PUT = %v, want store.ErrNotFound — the response claimed nothing was stored", headErr)
 	}
 }
 
@@ -440,9 +442,10 @@ func TestDotDotSegmentNeverReachesAHandler(t *testing.T) {
 }
 
 func TestOversizeContentLengthIs413(t *testing.T) {
-	ts := newTestServer(t)
-	ts.store.cfg.MaxObjectSize = 8
-	srv := httptest.NewServer(NewHandler(ts.store).Mux())
+	cfg := newTestConfig(t)
+	cfg.MaxObjectSize = 8
+	s := openTestStore(t, cfg)
+	srv := httptest.NewServer(NewHandler(s).Mux())
 	defer srv.Close()
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
@@ -459,15 +462,16 @@ func TestOversizeContentLengthIs413(t *testing.T) {
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversize with Content-Length = %d, want 413", resp.StatusCode)
 	}
-	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
+	if n := countFiles(t, s.TmpDir()); n != 0 {
 		t.Errorf("temp files left behind = %d, want 0", n)
 	}
 }
 
 func TestOversizeChunkedIs413(t *testing.T) {
-	ts := newTestServer(t)
-	ts.store.cfg.MaxObjectSize = 8
-	srv := httptest.NewServer(NewHandler(ts.store).Mux())
+	cfg := newTestConfig(t)
+	cfg.MaxObjectSize = 8
+	s := openTestStore(t, cfg)
+	srv := httptest.NewServer(NewHandler(s).Mux())
 	defer srv.Close()
 
 	// An io.Reader of unknown length makes net/http use chunked encoding, so
@@ -487,7 +491,7 @@ func TestOversizeChunkedIs413(t *testing.T) {
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversize chunked = %d, want 413", resp.StatusCode)
 	}
-	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
+	if n := countFiles(t, s.TmpDir()); n != 0 {
 		t.Errorf("temp files left behind = %d, want 0", n)
 	}
 }
@@ -630,7 +634,7 @@ func TestFailedPreconditionLeavesNoTrace(t *testing.T) {
 		t.Fatalf("status = %d, want 412", resp.StatusCode)
 	}
 
-	if n := countFiles(t, ts.store.tmpDir()); n != 0 {
+	if n := countFiles(t, ts.store.TmpDir()); n != 0 {
 		t.Errorf("temp files = %d, want 0", n)
 	}
 	var blobs int
@@ -645,11 +649,14 @@ func TestFailedPreconditionLeavesNoTrace(t *testing.T) {
 // TestOversizeWithFailingIfMatchIs412 proves the advisory pre-check fires:
 // the doomed body is never transferred, so the answer is 412 and not 413.
 func TestOversizeWithFailingIfMatchIs412(t *testing.T) {
-	ts := newTestServer(t)
+	// Opened at the small limit from the start: "hello" is 5 bytes, so the
+	// setup PUT still fits, and the oversize request below meets a handler
+	// that would reject it on size if the precondition did not fire first.
+	cfg := newTestConfig(t)
+	cfg.MaxObjectSize = 8
+	ts := newTestServerWithConfig(t, cfg)
 	ts.put(t, "/objects/b1/a", "hello")
-	ts.store.cfg.MaxObjectSize = 8
-	srv := httptest.NewServer(NewHandler(ts.store).Mux())
-	defer srv.Close()
+	srv := ts.Server
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
 		srv.URL+"/objects/b1/a", strings.NewReader(strings.Repeat("x", 100)))
